@@ -78,12 +78,14 @@ describe('message history (IAgentContextMemoryService)', () => {
     expect(ctx.get().map(textOf)).toEqual(['keep']);
   });
 
-  it('does not stamp local ids on appended messages (ids are not persisted)', () => {
+  it('assigns distinct persisted ids to repeated appended messages', () => {
     const ctx = ix.get(IAgentContextMemoryService);
     ctx.append(textMessage('user', 'hello'));
 
     const [message] = ctx.get();
-    expect(message?.id).toBeUndefined();
+    expect(message?.id).toEqual(expect.any(String));
+    ctx.append(textMessage('user', 'hello'));
+    expect(ctx.get()[1]?.id).not.toBe(message?.id);
   });
 
   it('preserves an existing message id (idempotent)', () => {

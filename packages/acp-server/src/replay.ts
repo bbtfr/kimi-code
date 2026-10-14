@@ -1,34 +1,16 @@
-/**
- * `session/load` history replay — projects the main agent's persisted context
- * history (`IAgentContextMemoryService.get()`) into an ordered batch of ACP
- * `session/update` notifications so a loaded session re-renders its prior
- * turns on the client.
- *
- * Pure projection: {@link projectHistoryToSessionUpdates} maps a
- * `ContextMessage[]` to a `SessionNotification[]` with no IO, so the mapping
- * is unit-testable without a live connection. The caller (`AcpSession`)
- * awaits each push in order — replay is a one-shot batch whose completion
- * ordering is what tells `loadSession` the response is safe to return.
- *
- * Turn / tool-call correlation: agent-core-v2 persists tool calls on the
- * assistant message that issued them and tool results as separate `tool`-role
- * messages. ACP needs a single `toolCallId` to correlate the create with its
- * terminal update. Since the persisted history carries no real turn ids, the
- * replay mints a synthetic monotonically-increasing `turnId` per assistant
- * message and records `toolCallId → turnId` so the trailing `tool` messages
- * can look up the id that issued them.
- */
-
 import type { SessionNotification } from '@agentclientprotocol/sdk';
 import type { ContentPart, ContextMessage, ToolCall } from '@moonshot-ai/agent-core-v2';
+import type { ToolResultEvent } from '@moonshot-ai/agent-core-v2/events';
 import type { ToolCallStartedEvent } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
 
 import {
   assistantDeltaToSessionUpdate,
   thinkingDeltaToSessionUpdate,
   toolCallStartToSessionUpdate,
-  toolCallLocations,
-  withToolDisplay,
+  completedToolToSessionUpdate,
+  contextMessageToSessionUpdates,
+  legacyMessageId,
+  planFromDisplayBlock,
 } from './events-map';
 
 /**
@@ -39,30 +21,29 @@ import {
 export interface AcpHistory {
   readonly messages: readonly ContextMessage[];
   readonly toolCalls?: ReadonlyMap<string, ToolCallStartedEvent>;
+  readonly toolResults?: ReadonlyMap<string, ToolResultEvent>;
 }
 
 export function projectHistoryToSessionUpdates(
   sessionId: string,
   messages: readonly ContextMessage[],
   toolCalls?: AcpHistory['toolCalls'],
+  toolResults?: AcpHistory['toolResults'],
 ): SessionNotification[] {
   const out: SessionNotification[] = [];
   let turnId = 0;
   const toolCallTurnIds = new Map<string, number>();
 
-  for (const message of messages) {
+  for (const [position, message] of messages.entries()) {
     switch (message.role) {
       case 'user':
-        for (const part of message.content) {
-          if (part.type === 'text' && part.text) {
-            out.push(userMessageChunk(sessionId, part.text));
-          }
-        }
+      case 'system':
+        out.push(...contextMessageToSessionUpdates(sessionId, message, legacyMessageId(message, position)));
         break;
       case 'assistant': {
         turnId += 1;
         for (const part of message.content) {
-          const update = assistantContentPartToUpdate(part, sessionId, turnId);
+          const update = assistantContentPartToUpdate(part, sessionId, turnId, message.id ?? legacyMessageId(message, position));
           if (update !== null) out.push(update);
         }
         for (const toolCall of message.toolCalls ?? []) {
@@ -72,50 +53,42 @@ export function projectHistoryToSessionUpdates(
           out.push(recorded === undefined
             ? syntheticToolCall(sessionId, callTurnId, toolCall)
             : toolCallStartToSessionUpdate(sessionId, recorded));
+          if (recorded?.display !== undefined) {
+            const plan = planFromDisplayBlock(sessionId, callTurnId, recorded.display);
+            if (plan !== null) out.push(plan);
+          }
         }
         break;
       }
       case 'tool': {
-        const update = toolMessageToUpdate(message, sessionId, toolCallTurnIds, toolCalls?.get(message.toolCallId ?? ''));
+        const update = toolMessageToUpdate(message, sessionId, toolCallTurnIds, toolCalls?.get(message.toolCallId ?? ''), toolResults?.get(message.toolCallId ?? ''));
         if (update !== null) out.push(update);
         break;
       }
-      case 'system':
-        // System messages have no ACP counterpart.
-        break;
     }
   }
   return out;
-}
-
-function userMessageChunk(sessionId: string, text: string): SessionNotification {
-  return {
-    sessionId,
-    update: {
-      sessionUpdate: 'user_message_chunk',
-      content: { type: 'text', text },
-    },
-  };
 }
 
 function assistantContentPartToUpdate(
   part: ContentPart,
   sessionId: string,
   turnId: number,
+  messageId?: string,
 ): SessionNotification | null {
   if (part.type === 'text' && part.text) {
     return assistantDeltaToSessionUpdate(sessionId, {
       type: 'assistant.delta',
       turnId,
       delta: part.text,
-    });
+    }, messageId);
   }
   if (part.type === 'think' && part.think && part.hidden !== true) {
     return thinkingDeltaToSessionUpdate(sessionId, {
       type: 'thinking.delta',
       turnId,
       delta: part.think,
-    });
+    }, messageId);
   }
   // image_url / audio_url / video_url belong to the user-input side and ACP
   // has no dedicated assistant-media chunk; skip them.
@@ -141,6 +114,7 @@ function toolMessageToUpdate(
   sessionId: string,
   toolCallTurnIds: ReadonlyMap<string, number>,
   recorded?: ToolCallStartedEvent,
+  result?: ToolResultEvent,
 ): SessionNotification | null {
   const rawToolCallId = message.toolCallId;
   if (!rawToolCallId) {
@@ -156,18 +130,13 @@ function toolMessageToUpdate(
     // client never saw would orphan the card.
     return null;
   }
-  const isError = message.isError === true;
-  return {
-    sessionId,
-    update: {
-      sessionUpdate: 'tool_call_update',
-      toolCallId: `${turnId}:${rawToolCallId}`,
-      status: isError ? 'failed' : 'completed',
-      content: withToolDisplay(toolMessageContentToAcpToolCallContent(message.content), recorded?.display),
-      rawOutput: message.content,
-      locations: recorded === undefined ? undefined : toolCallLocations(recorded.name, recorded.args, recorded.display),
-    },
-  };
+  return completedToolToSessionUpdate(sessionId, result ?? {
+    type: 'tool.result',
+    turnId,
+    toolCallId: rawToolCallId,
+    isError: message.isError,
+    output: message.content,
+  }, recorded);
 }
 
 /**
@@ -182,26 +151,4 @@ function parseToolCallArguments(rawArguments: string | null): unknown {
   } catch {
     return rawArguments;
   }
-}
-
-/**
- * Project a `tool`-role message's content parts into the ACP
- * `tool_call_update.content` shape. Text parts surface directly; anything else
- * (image refs, etc.) becomes a `[type]` placeholder so the result card is not
- * empty.
- */
-function toolMessageContentToAcpToolCallContent(
-  parts: readonly ContentPart[],
-): Array<{ type: 'content'; content: { type: 'text'; text: string } }> {
-  const result: Array<{ type: 'content'; content: { type: 'text'; text: string } }> = [];
-  for (const part of parts) {
-    if (part.type === 'text') {
-      if (part.text) {
-        result.push({ type: 'content', content: { type: 'text', text: part.text } });
-      }
-      continue;
-    }
-    result.push({ type: 'content', content: { type: 'text', text: `[${part.type}]` } });
-  }
-  return result;
 }

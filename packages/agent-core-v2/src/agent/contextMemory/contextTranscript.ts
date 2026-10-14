@@ -58,8 +58,8 @@ export function createContextTranscriptReducer(): ContextTranscriptReducer {
   };
 
   const fold = createLoopEventFold({
-    openAssistant: (time) => {
-      openEntry = { message: { role: 'assistant', content: [], toolCalls: [] }, time };
+    openAssistant: (time, stepId) => {
+      openEntry = { message: { id: stepId, role: 'assistant', content: [], toolCalls: [] }, time };
       push(openEntry);
     },
     appendOpenContent: (part) => {

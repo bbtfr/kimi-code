@@ -1,3 +1,5 @@
+import { randomUUID } from 'node:crypto';
+
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope } from '#/app/scopes';
 import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
@@ -58,12 +60,13 @@ export class AgentContextMemoryService extends Disposable implements IAgentConte
   append(...messages: readonly ContextMessage[]): void {
     if (messages.length === 0) return;
     const start = this.get().length;
-    for (const message of messages) {
+    const identified = messages.map((message) => ({ ...message, id: message.id ?? randomUUID() }));
+    for (const message of identified) {
       void this.dispatcher.dispatch(
         new ContextAppendMessage({ agentId: this.scopeContext.agentId, message }),
       );
     }
-    this.publishSplice({ start, deleteCount: 0, messages: [...messages] });
+    this.publishSplice({ start, deleteCount: 0, messages: identified });
   }
 
   appendLoopEvent(event: LoopRecordedEvent): void {

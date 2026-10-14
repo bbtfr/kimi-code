@@ -1,3 +1,4 @@
+import type { ContextAppendMessage } from '@moonshot-ai/agent-core-v2/agent/contextMemory/contextEvents';
 /**
  * Compile-time parity checks between klient wire schemas and the engine
  * types they mirror. Plain `.ts` (not `.test.ts`) — vitest must not pick it
@@ -150,6 +151,7 @@ import type {
   AssistantDeltaEvent,
   ThinkingDeltaEvent,
   TurnStartedEvent,
+  TurnStepStartedEvent,
 } from '@moonshot-ai/agent-core-v2/agent/loop/turnEvents';
 import type { TurnEndedEvent } from '@moonshot-ai/agent-core-v2/agent/loop/turnOps';
 import type {
@@ -210,6 +212,8 @@ import {
   toolResultEventSchema,
   turnEndedEventSchema,
   turnStartedEventSchema,
+  turnStepStartedEventSchema,
+  contextAppendMessageEventSchema,
   warningEventSchema,
 } from '../src/contract/agent/events.js';
 import {
@@ -697,6 +701,8 @@ const _fullCompactionInput: AssertWire<typeof fullCompactionInputSchema, FullCom
 // Parity against the protocol event types (the stream carries flat
 // `{ type, ... }` events; schemas keep the `type` literal). One-directional
 // where a field is mirrored as `unknown`.
+const _contextAppendMessageEvent: AssertEngineToWire<typeof contextAppendMessageEventSchema, Omit<ContextAppendMessage, 'type'> & { type: 'context.append_message' }> = true;
+const _turnStepStartedEvent: AssertWire<typeof turnStepStartedEventSchema, TurnStepStartedEvent> = true;
 const _turnStartedEvent: AssertEngineToWire<typeof turnStartedEventSchema, TurnStartedEvent> = true;
 const _turnEndedEvent: AssertEngineToWire<typeof turnEndedEventSchema, TurnEndedEvent> = true;
 const _assistantDeltaEvent: AssertWire<typeof assistantDeltaEventSchema, AssistantDeltaEvent> =

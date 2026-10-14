@@ -641,6 +641,8 @@ describe('event hub', () => {
     const klient = createKlientFromChannel(channel);
     const agent = klient.session('s1').agent('main');
     const seen = {
+      context: [] as unknown[],
+      step: [] as unknown[],
       delta: [] as unknown[],
       progress: [] as unknown[],
       started: [] as unknown[],
@@ -653,6 +655,8 @@ describe('event hub', () => {
       errors.push(error);
     });
 
+    agent.events.on('context.append_message', (event) => seen.context.push(event));
+    agent.events.on('turn.step.started', (event) => seen.step.push(event));
     agent.events.on('tool.call.delta', (event) => seen.delta.push(event));
     agent.events.on('tool.progress', (event) => seen.progress.push(event));
     agent.events.on('compaction.started', (event) => seen.started.push(event));
@@ -660,7 +664,7 @@ describe('event hub', () => {
     agent.events.on('compaction.cancelled', (event) => seen.cancelled.push(event));
     agent.events.on('compaction.completed', (event) => seen.completed.push(event));
 
-    // All six registrations share one `events` stream subscription bound to
+    // All registrations share one `events` stream subscription bound to
     // the agent scope.
     expect(channel.subscriptions).toHaveLength(1);
     expect(channel.subscriptions[0]?.scope).toEqual({ sessionId: 's1', agentId: 'main' });
@@ -680,6 +684,10 @@ describe('event hub', () => {
       type: 'compaction.completed',
       result: { summary: 's', compactedCount: 3, tokensBefore: 100, tokensAfter: 40 },
     };
+    const context = { type: 'context.append_message', time: 1, message: { id: 'notice', role: 'user', content: [{ type: 'text', text: 'task done' }] } };
+    const step = { type: 'turn.step.started', turnId: 1, step: 0, stepId: 'step-id' };
+    channel.emit(0, context);
+    channel.emit(0, step);
     channel.emit(0, delta);
     channel.emit(0, progress);
     channel.emit(0, started);
@@ -690,6 +698,8 @@ describe('event hub', () => {
     channel.emit(0, { type: 'unregistered.type', turnId: 1 });
     await tick();
 
+    expect(seen.context).toEqual([context]);
+    expect(seen.step).toEqual([step]);
     expect(seen.delta).toEqual([delta]);
     expect(seen.progress).toEqual([progress]);
     expect(seen.started).toEqual([started]);

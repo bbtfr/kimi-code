@@ -75,7 +75,9 @@ import {
   toolCallStartedUpgradeToSessionUpdate,
   toolCallStartToSessionUpdate,
   toolProgressToSessionUpdate,
-  toolResultToSessionUpdate,
+  completedToolToSessionUpdate,
+  contextMessageToSessionUpdates,
+  legacyMessageId,
   turnEndReasonToStopReason,
   usageUpdateNotification,
   isAuthError,
@@ -194,7 +196,8 @@ export class AcpSession {
   /** The in-flight prompt's driver, if any. */
   private driver: TurnDriver | undefined;
   private activeTurnId: number | undefined;
-  private readonly toolDisplays = new Map<string, ToolInputDisplay>();
+  private readonly toolCalls = new Map<string, ToolCallStartedEvent>();
+  private stepId: string | undefined;
   /**
    * Abort markers of prompts still in their pre-turn image-compression phase
    * (no turn launched yet, so `agent.cancel` has nothing to cancel).
@@ -277,11 +280,19 @@ export class AcpSession {
   async init(): Promise<void> {
     const events = this.agent.events;
     this.subscriptions.push(
+      events.on('context.append_message', (event) => {
+        const message = event.message as ContextMessage;
+        if (message.origin?.kind === 'user' && !message.origin.inTurn) return;
+        this.dispatchTurnEvent(this.activeTurnId ?? -1, () => {
+          for (const update of contextMessageToSessionUpdates(this.sessionId, message, legacyMessageId(message, event.time))) this.emit(update);
+        });
+      }),
+      events.on('turn.step.started', (event) => {
+        this.dispatchTurnEvent(event.turnId, () => { this.stepId = event.stepId; });
+      }),
       events.on('turn.started', (event) => {
         this.activeTurnId = event.turnId;
-        this.dispatchTurnEvent(event.turnId, () => {
-          this.onTurnStarted(event);
-        });
+        this.stepId = undefined;
       }),
       events.on('assistant.delta', (event) => {
         this.dispatchTurnEvent(event.turnId, () => {
@@ -413,11 +424,12 @@ export class AcpSession {
   async replayHistory(): Promise<void> {
     let messages: readonly ContextMessage[];
     let toolCalls: AcpHistory['toolCalls'];
+    let toolResults: AcpHistory['toolResults'];
     try {
       // `history` items cross the wire as JSON-cloned `ContextMessage`s (the
       // facade types them via the engine RPC signature).
       if (this.readHistory !== undefined) {
-        ({ messages, toolCalls } = await this.readHistory(this.sessionId));
+        ({ messages, toolCalls, toolResults } = await this.readHistory(this.sessionId));
       } else {
         messages = (await this.agent.getContext()).history;
       }
@@ -428,7 +440,7 @@ export class AcpSession {
       });
       return;
     }
-    const updates = projectHistoryToSessionUpdates(this.sessionId, messages, toolCalls);
+    const updates = projectHistoryToSessionUpdates(this.sessionId, messages, toolCalls, toolResults);
     for (const update of updates) {
       try {
         await this.conn.sessionUpdate(update);
@@ -747,35 +759,19 @@ export class AcpSession {
     return driver;
   }
 
-  private onTurnStarted(event: AgentEventPayloads['turn.started']): void {
-    if (this.driverFor(event.turnId) !== undefined) return;
-    const kind = (event.origin as { kind?: string } | undefined)?.kind;
-    const label = kind === 'cron_job' ? 'Scheduled task' : kind === 'task' ? 'Background task' : 'Background turn';
-    this.emit({
-      sessionId: this.sessionId,
-      update: {
-        sessionUpdate: 'user_message_chunk',
-        content: { type: 'text', text: event.prompt ?? `[${label}]` },
-        _meta: { turnId: event.turnId, origin: event.origin },
-      },
-    });
-  }
-
   private onAssistantDelta(event: AgentEventPayloads['assistant.delta']): void {
-    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event));
+    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event, this.stepId));
   }
 
   private onThinkingDelta(event: AgentEventPayloads['thinking.delta']): void {
-    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event));
+    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event, this.stepId));
   }
 
   private onToolCallStarted(event: AgentEventPayloads['tool.call.started']): void {
     // The klient payload mirrors `ToolCallStartedEvent` (`args` / `display`
     // arrive as `unknown` — cast at this seam).
     const mapped = event as unknown as ToolCallStartedEvent;
-    if (mapped.display !== undefined) {
-      this.toolDisplays.set(acpToolCallId(event.turnId, event.toolCallId), mapped.display);
-    }
+    this.toolCalls.set(acpToolCallId(event.turnId, event.toolCallId), mapped);
     const key = acpToolCallId(event.turnId, event.toolCallId);
     const locations = toolCallLocations(mapped.name, mapped.args, mapped.display);
     if (locations !== undefined) {
@@ -844,8 +840,8 @@ export class AcpSession {
   private onToolResult(event: AgentEventPayloads['tool.result']): void {
     const key = acpToolCallId(event.turnId, event.toolCallId);
     const locations = this.toolLocations.get(key);
-    const display = this.toolDisplays.get(key);
-    this.toolDisplays.delete(key);
+    const call = this.toolCalls.get(key);
+    this.toolCalls.delete(key);
     this.toolLocations.delete(key);
     this.bashCallsAwaitingTerminal.delete(key);
     this.toolCallStreamArgs.delete(key);
@@ -869,7 +865,7 @@ export class AcpSession {
       return;
     }
     this.emit(
-      toolResultToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, locations, display),
+      completedToolToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, call),
     );
   }
 
@@ -936,7 +932,7 @@ export class AcpSession {
       if (!key.startsWith(prefix)) continue;
       this.toolCallStreamArgs.delete(key);
       this.toolLocations.delete(key);
-      this.toolDisplays.delete(key);
+      this.toolCalls.delete(key);
       this.bashCallsAwaitingTerminal.delete(key);
       this.terminalBackedCalls.delete(key);
     }

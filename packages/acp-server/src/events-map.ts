@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import type { ContextMessage } from '@moonshot-ai/agent-core-v2';
 import { isAbsolute } from 'node:path';
 
 import type {
@@ -33,11 +35,13 @@ import type { AcpStopReason } from './types';
 export function assistantDeltaToSessionUpdate(
   sessionId: string,
   event: AssistantDeltaEvent,
+  messageId?: string,
 ): SessionNotification {
   return {
     sessionId,
     update: {
       sessionUpdate: 'agent_message_chunk',
+      messageId,
       content: { type: 'text', text: event.delta },
     },
   };
@@ -354,11 +358,13 @@ export function toolProgressToSessionUpdate(
 export function thinkingDeltaToSessionUpdate(
   sessionId: string,
   event: ThinkingDeltaEvent,
+  messageId?: string,
 ): SessionNotification {
   return {
     sessionId,
     update: {
       sessionUpdate: 'agent_thought_chunk',
+      messageId,
       content: { type: 'text', text: event.delta },
     },
   };
@@ -377,6 +383,7 @@ export function toolResultToSessionUpdate(
   event: ToolResultEvent,
   locations?: ToolCallLocation[],
   display?: ToolInputDisplay,
+  title?: string,
 ): SessionNotification {
   return {
     sessionId,
@@ -384,6 +391,7 @@ export function toolResultToSessionUpdate(
       sessionUpdate: 'tool_call_update',
       toolCallId: acpToolCallId(event.turnId, event.toolCallId),
       status: event.isError ? 'failed' : 'completed',
+      title,
       content: withToolDisplay(toolResultToAcpContent(event), display),
       rawOutput: event.output,
       locations,
@@ -393,16 +401,15 @@ export function toolResultToSessionUpdate(
 
 /**
  * Translate a TodoList display block into an ACP `plan` session update.
- * `done` rewrites to `completed`; `priority` defaults to `'medium'`. Returns
- * `null` for an empty items array.
+ * `done` rewrites to `completed`; `priority` defaults to `'medium'`. Empty
+ * entries clear the client's previous plan.
  */
 export function todoListToSessionUpdate(
   sessionId: string,
   turnId: number,
   items: ReadonlyArray<{ title: string; status: string }>,
-): SessionNotification | null {
+): SessionNotification {
   void turnId;
-  if (items.length === 0) return null;
   const entries: PlanEntry[] = items.map((item) => ({
     content: item.title,
     priority: 'medium',
@@ -544,4 +551,53 @@ export function withToolDisplay(
 ): ToolCallContent[] {
   const block = display === undefined ? null : displayBlockToAcpContent(display);
   return block === null ? content : [block, ...content];
+}
+
+/** Both observed context messages and replayed messages cross this boundary. */
+export function contextMessageToSessionUpdates(
+  sessionId: string,
+  message: ContextMessage,
+  fallbackId: string,
+): SessionNotification[] {
+  if (message.role !== 'user' && message.role !== 'system') return [];
+  const origin = message.origin;
+  if (message.role === 'system' && origin === undefined) return [];
+  let label: string | undefined;
+  switch (origin?.kind) {
+    case 'task': label = `Task · ${origin.status}`; break;
+    case 'cron_job': label = 'Cron'; break;
+    case 'system_trigger': label = `System · ${origin.name}`; break;
+    case 'injection': label = `Context · ${origin.variant}`; break;
+    case 'compaction_summary': label = 'Compaction'; break;
+    default: label = origin?.kind === 'user' ? undefined : origin?.kind; break;
+  }
+  const text = message.content.filter(p => p.type === 'text').map(p => p.text).join('');
+  if (!text) return [];
+  return [{
+    sessionId,
+    update: {
+      sessionUpdate: 'user_message_chunk',
+      messageId: message.id ?? fallbackId,
+      content: { type: 'text', text: label === undefined ? text : `[${label}]\n${text}` },
+      _meta: { origin },
+    },
+  }];
+}
+
+export function legacyMessageId(message: ContextMessage, position: number): string {
+  return `context:${position}:${createHash('sha256').update(JSON.stringify(message)).digest('hex').slice(0, 16)}`;
+}
+
+/** One terminal tool projection, shared by live delivery and journal replay. */
+export function completedToolToSessionUpdate(
+  sessionId: string,
+  event: ToolResultEvent,
+  call?: ToolCallStartedEvent,
+): SessionNotification {
+  return toolResultToSessionUpdate(
+    sessionId, event,
+    call === undefined ? undefined : toolCallLocations(call.name, call.args, call.display),
+    call?.display,
+    call === undefined ? undefined : call.description ?? call.name,
+  );
 }

@@ -18,6 +18,7 @@ export interface ToolCallStartedPayload {
   readonly name: string;
   readonly args: unknown;
   readonly display?: ToolInputDisplay;
+  readonly description?: string;
 }
 
 export interface ToolExecutorExecuteOptions {

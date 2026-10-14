@@ -1515,6 +1515,7 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
           args: event.args,
           extras,
           display: event.display,
+          description: event.description,
         });
         return;
       }
@@ -1675,6 +1676,8 @@ export class AgentLoopService extends Disposable implements IAgentLoopService {
             toolCallId: payload.toolCallId,
             name: payload.name,
             args: payload.args,
+            description: payload.description,
+            display: payload.display,
             extras,
           });
         },
