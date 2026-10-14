@@ -376,6 +376,7 @@ export function toolResultToSessionUpdate(
   sessionId: string,
   event: ToolResultEvent,
   locations?: ToolCallLocation[],
+  display?: ToolInputDisplay,
 ): SessionNotification {
   return {
     sessionId,
@@ -383,7 +384,7 @@ export function toolResultToSessionUpdate(
       sessionUpdate: 'tool_call_update',
       toolCallId: acpToolCallId(event.turnId, event.toolCallId),
       status: event.isError ? 'failed' : 'completed',
-      content: toolResultToAcpContent(event),
+      content: withToolDisplay(toolResultToAcpContent(event), display),
       rawOutput: event.output,
       locations,
     },
@@ -534,4 +535,13 @@ export function sessionInfoUpdateNotification(
       title,
     },
   };
+}
+
+/** ACP replaces content on update; preserve the tool's display through completion. */
+export function withToolDisplay(
+  content: ToolCallContent[],
+  display?: ToolInputDisplay,
+): ToolCallContent[] {
+  const block = display === undefined ? null : displayBlockToAcpContent(display);
+  return block === null ? content : [block, ...content];
 }

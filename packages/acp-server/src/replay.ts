@@ -21,11 +21,14 @@
 
 import type { SessionNotification } from '@agentclientprotocol/sdk';
 import type { ContentPart, ContextMessage, ToolCall } from '@moonshot-ai/agent-core-v2';
+import type { ToolCallStartedEvent } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
 
 import {
   assistantDeltaToSessionUpdate,
   thinkingDeltaToSessionUpdate,
   toolCallStartToSessionUpdate,
+  toolCallLocations,
+  withToolDisplay,
 } from './events-map';
 
 /**
@@ -33,9 +36,15 @@ import {
  * `session/update` notifications. Pure — no IO, never throws on a single
  * malformed message (it is skipped).
  */
+export interface AcpHistory {
+  readonly messages: readonly ContextMessage[];
+  readonly toolCalls?: ReadonlyMap<string, ToolCallStartedEvent>;
+}
+
 export function projectHistoryToSessionUpdates(
   sessionId: string,
   messages: readonly ContextMessage[],
+  toolCalls?: AcpHistory['toolCalls'],
 ): SessionNotification[] {
   const out: SessionNotification[] = [];
   let turnId = 0;
@@ -57,18 +66,22 @@ export function projectHistoryToSessionUpdates(
           if (update !== null) out.push(update);
         }
         for (const toolCall of message.toolCalls ?? []) {
-          toolCallTurnIds.set(toolCall.id, turnId);
-          out.push(syntheticToolCall(sessionId, turnId, toolCall));
+          const recorded = toolCalls?.get(toolCall.id);
+          const callTurnId = recorded?.turnId ?? turnId;
+          toolCallTurnIds.set(toolCall.id, callTurnId);
+          out.push(recorded === undefined
+            ? syntheticToolCall(sessionId, callTurnId, toolCall)
+            : toolCallStartToSessionUpdate(sessionId, recorded));
         }
         break;
       }
       case 'tool': {
-        const update = toolMessageToUpdate(message, sessionId, toolCallTurnIds);
+        const update = toolMessageToUpdate(message, sessionId, toolCallTurnIds, toolCalls?.get(message.toolCallId ?? ''));
         if (update !== null) out.push(update);
         break;
       }
-      default:
-        // system / unknown roles — ACP has no analogue; skip.
+      case 'system':
+        // System messages have no ACP counterpart.
         break;
     }
   }
@@ -127,6 +140,7 @@ function toolMessageToUpdate(
   message: ContextMessage,
   sessionId: string,
   toolCallTurnIds: ReadonlyMap<string, number>,
+  recorded?: ToolCallStartedEvent,
 ): SessionNotification | null {
   const rawToolCallId = message.toolCallId;
   if (!rawToolCallId) {
@@ -149,7 +163,9 @@ function toolMessageToUpdate(
       sessionUpdate: 'tool_call_update',
       toolCallId: `${turnId}:${rawToolCallId}`,
       status: isError ? 'failed' : 'completed',
-      content: toolMessageContentToAcpToolCallContent(message.content),
+      content: withToolDisplay(toolMessageContentToAcpToolCallContent(message.content), recorded?.display),
+      rawOutput: message.content,
+      locations: recorded === undefined ? undefined : toolCallLocations(recorded.name, recorded.args, recorded.display),
     },
   };
 }

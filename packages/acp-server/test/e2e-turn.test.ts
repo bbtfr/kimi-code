@@ -14,9 +14,10 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { getLiveSessionById, IAgentLifecycleService, IEventBus } from '@moonshot-ai/agent-core-v2';
+import { getLiveSessionById, IAgentLifecycleService, IAgentCronService, IAgentLoopService, IEventBus } from '@moonshot-ai/agent-core-v2';
+import type { SessionNotification } from '@agentclientprotocol/sdk';
 import { ToolProgress } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { mapPromptLaunchError } from '../src/session';
 import { createTestClient, type TestClient } from './_helpers/acpClient';
@@ -43,6 +44,7 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
       await rm(homeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       homeDir = undefined;
     }
+    vi.unstubAllEnvs();
   });
 
   function installTerminalClient(c: TestClient): void {
@@ -103,6 +105,116 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     expect(usageUpdate?.size).toBe(8192);
     expect(usageUpdate?.used).toBeGreaterThan(0);
     expect(usageUpdate?.cost).toBeUndefined();
+  }, 30_000);
+
+  it('keeps Edit diffs through completion and a cold session/load', async () => {
+    let c = await boot();
+    const path = join(homeDir!, 'edit.txt');
+    await writeFile(path, 'before\n');
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    scripted!.mockNextResponse({
+      type: 'function', id: 'edit_call', name: 'Edit',
+      arguments: JSON.stringify({ path, old_string: 'before', new_string: 'after' }),
+    });
+    scripted!.mockNextText('edited');
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    await c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'edit the file' }],
+    });
+    const updates = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(updates.filter(u => u.sessionUpdate === 'user_message_chunk')).toEqual([]);
+    const completed = updates.find(u => u.sessionUpdate === 'tool_call_update' && u.status === 'completed');
+    expect(completed).toMatchObject({
+      toolCallId: '0:edit_call', rawOutput: expect.stringContaining('Replaced'),
+      content: expect.arrayContaining([{ type: 'diff', path, oldText: 'before', newText: 'after' }]),
+    });
+    await c.close();
+    client = undefined;
+    c = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    client = c;
+    await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await c.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    const replayed = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(replayed.find(u => u.sessionUpdate === 'tool_call_update' && u.status === 'completed')).toMatchObject({
+      toolCallId: '0:edit_call',
+      content: expect.arrayContaining([{ type: 'diff', path, oldText: 'before', newText: 'after' }]),
+    });
+    expect(scripted!.callCount()).toBe(2);
+  }, 30_000);
+
+  it('streams a real cron turn without an ACP prompt, including its origin, tools and answer', async () => {
+    const c = await boot();
+    const clock = join(homeDir!, 'clock');
+    const now = Date.UTC(2026, 0, 1);
+    await writeFile(clock, String(now));
+    vi.stubEnv('KIMI_CRON_CLOCK', `file:${clock}`);
+    vi.stubEnv('KIMI_CRON_MANUAL_TICK', '1');
+    vi.stubEnv('KIMI_CRON_NO_JITTER', '1');
+    vi.stubEnv('KIMI_DISABLE_CRON', '0');
+    scripted!.mockNextResponse({ type: 'think', think: 'checking the scheduled task' }, {
+      type: 'function', id: 'cron_read', name: 'Read', arguments: JSON.stringify({ path: clock }),
+    });
+    scripted!.mockNextText('scheduled task finished');
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const session = getLiveSessionById(c.server.core.accessor, created.sessionId)!;
+    const agent = session.accessor.get(IAgentLifecycleService).handleOf('main')!;
+    const cron = agent.accessor.get(IAgentCronService);
+    cron.addTask({ cron: '* * * * *', prompt: 'check the clock', recurring: false });
+    await writeFile(clock, String(now + 60_000));
+    expect(cron.list()).toHaveLength(1);
+    expect(cron.now()).toBe(now + 60_000);
+    expect(cron.getNextFireTime()).toBe(now + 60_000);
+    await cron.tick();
+    await expect.poll(() => scripted!.callCount(), { timeout: 2000 }).toBe(2);
+    await c.waitForSessionUpdate('usage_update', 10_000);
+    const updates = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(updates).toContainEqual(expect.objectContaining({
+      sessionUpdate: 'user_message_chunk', content: expect.objectContaining({ text: '[Scheduled task]' }),
+      _meta: expect.objectContaining({ origin: expect.objectContaining({ kind: 'cron_job' }) }),
+    }));
+    expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'agent_thought_chunk' }));
+    expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'tool_call_update', status: 'completed' }));
+    expect(updates).toContainEqual(expect.objectContaining({
+      sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'scheduled task finished' },
+    }));
+    expect(scripted!.callCount()).toBe(2);
+    scripted!.mockNextText('ordinary follow-up');
+    expect(await c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'continue' }],
+    })).toMatchObject({ stopReason: 'end_turn' });
+  }, 30_000);
+
+  it('can cancel an autonomous task turn and rejects a competing ACP prompt', async () => {
+    const c = await boot();
+    scripted!.mockNextResponse({
+      type: 'function', id: 'task_bash', name: 'Bash', arguments: JSON.stringify({ command: 'sleep 30' }),
+    });
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const session = getLiveSessionById(c.server.core.accessor, created.sessionId)!;
+    const agent = session.accessor.get(IAgentLifecycleService).handleOf('main')!;
+    const loop = agent.accessor.get(IAgentLoopService);
+    const origin = { kind: 'task', taskId: 'task-example', status: 'completed', notificationId: 'notification-example' };
+    loop.submit({
+      message: { role: 'user', content: [{ type: 'text', text: 'continue after task completion' }] },
+      meta: { origin },
+    });
+    await c.waitForSessionUpdate('tool_call', 10_000);
+    await expect(c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'overlapping prompt' }],
+    })).rejects.toThrow('turn.agent_busy');
+    c.notify('session/cancel', { sessionId: created.sessionId });
+    await c.waitForSessionUpdate('usage_update', 10_000);
+    await loop.settled();
+    expect(loop.snapshot().state).not.toBe('running');
+    expect(scripted!.callCount()).toBe(1);
   }, 30_000);
 
   it('runs a tool call and bridges the approval request to the client', async () => {
