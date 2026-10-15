@@ -162,25 +162,13 @@ describe('context notification envelopes', () => {
 });
 
 
-describe('Paseo system notification presentation', () => {
-  it('shares conversion between live context and replay without changing model history', () => {
-    for (const origin of [undefined, { kind: 'user' as const }, { kind: 'injection' as const, variant: 'test' }]) {
-      const text = '<paseo-system>\nSchedule "A & B" fired (id=schedule-1, run=run-1).\nRead <file> & report.\n</paseo-system>';
-      const message: ContextMessage = { id: 'schedule-message', role: 'user', origin, content: [{ type: 'text', text }], toolCalls: [] };
-      const before = JSON.stringify(message);
-      const live = contextMessageToSessionUpdates(SESSION_ID, message, 'fallback');
-      expect(projectHistoryToSessionUpdates(SESSION_ID, [message])).toEqual(live);
-      expect(live[0]?.update).toMatchObject({ content: { text: '<cron-fire source="paseo" jobId="schedule-1" runId="run-1" name="A &amp; B">\n<prompt>Schedule &quot;A &amp; B&quot; fired (id=schedule-1, run=run-1).\nRead &lt;file&gt; &amp; report.</prompt>\n</cron-fire>' } });
-      expect(JSON.stringify(message)).toBe(before);
-    }
-  });
-  it('falls back for unknown legacy notifications and preserves versioned/user/shell envelopes', () => {
-    const raw = '<paseo-system>\nUnknown & <event>\n</paseo-system>';
-    expect(formatContextNotification(raw, { kind: 'user' })).toBe('<notification category="system" type="paseo.system" source="paseo">\nTitle: System notification\n\nUnknown &amp; &lt;event&gt;\n</notification>');
-    expect(formatContextNotification(raw, { kind: 'shell_command', phase: 'output' })).toBe(raw);
-    for (const text of ['<paseo-system version="1" kind="agent-message" message-id="id">\nhello\n</paseo-system>', 'Example: ' + raw, '<paseo-system>incomplete', 'Answers to your questions:\n\nQuestion?\nAnswer']) {
-      expect(formatContextNotification(text, { kind: 'user' })).toBe(text);
-    }
-    expect(formatContextNotification('<paseo-system>\nSchedule fired (id=s1, run=r1).\ncheck\n</paseo-system>', undefined)).toContain('<cron-fire source="paseo" jobId="s1" runId="r1">');
+describe('opaque client envelopes', () => {
+  it('preserves client text and user channel in live context conversion and history', () => {
+    const text = '<client-context>\nClient-specific input & <details>\n</client-context>';
+    const message: ContextMessage = { id: 'client-message', role: 'user', origin: { kind: 'user' }, content: [{ type: 'text', text }], toolCalls: [] };
+    const live = contextMessageToSessionUpdates(SESSION_ID, message, 'fallback');
+    expect(projectHistoryToSessionUpdates(SESSION_ID, [message])).toEqual(live);
+    expect(live[0]?.update).toMatchObject({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text } });
+    expect(formatContextNotification(text, { kind: 'injection', variant: 'test' })).toBe(text);
   });
 });

@@ -130,16 +130,14 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     expect(usageUpdate?.cost).toBeUndefined();
   }, 30_000);
 
-  it('echoes converted Paseo schedule prompts live and identically after cold load', async () => {
+  it('preserves opaque client envelopes as user messages after cold load', async () => {
     let c = await boot();
-    scripted!.mockNextText('schedule received');
+    scripted!.mockNextText('received');
     const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
-    const text = '<paseo-system>\nSchedule "Check" fired (id=s1, run=r1).\nCheck <file> & report.\n</paseo-system>';
+    const text = '<client-context>\nCheck <file> & report.\n</client-context>';
     await c.send('session/prompt', { sessionId: created.sessionId, prompt: [{ type: 'text', text }] });
-    const live = c.sessionUpdates().map(m => (m.params as SessionNotification).update)
-      .filter(u => u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text' && u.content.text.startsWith('<cron-fire'));
-    expect(live).toHaveLength(1);
-    expect(live[0]).toMatchObject({ content: { text: expect.stringContaining('Check &lt;file&gt; &amp; report.') } });
+    const live = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(live.filter(u => u.sessionUpdate === 'user_message_chunk' && u.content.type === 'text' && u.content.text === text)).toHaveLength(0);
     await c.close();
     client = undefined;
     c = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
@@ -147,8 +145,8 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
     await c.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
     const replay = c.sessionUpdates().map(m => (m.params as SessionNotification).update)
-      .filter(u => u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text' && u.content.text.startsWith('<cron-fire'));
-    expect(replay).toEqual(live);
+      .filter(u => u.sessionUpdate === 'user_message_chunk' && u.content.type === 'text' && u.content.text === text);
+    expect(replay).toHaveLength(1);
   }, 30_000);
 
   it('keeps Edit diffs through completion and a cold session/load', async () => {

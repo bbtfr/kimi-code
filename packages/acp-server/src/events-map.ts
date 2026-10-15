@@ -564,13 +564,10 @@ export function contextMessageToSessionUpdates(
   if (message.role === 'system' && origin === undefined) return [];
   const text = message.content.filter(p => p.type === 'text').map(p => p.text).join('');
   if (!text) return [];
-  // Paseo suppresses user echoes during a foreground turn. System envelopes
-  // use the output channel so the presentation survives live delivery too.
-  const paseo = origin?.kind === 'shell_command' ? undefined : formatPaseoSystemNotification(text);
   return [{
     sessionId,
     update: {
-      sessionUpdate: paseo === undefined ? 'user_message_chunk' : 'agent_message_chunk',
+      sessionUpdate: 'user_message_chunk',
       messageId: message.id ?? fallbackId,
       content: { type: 'text', text: formatContextNotification(text, origin) },
       _meta: { origin },
@@ -581,8 +578,6 @@ export function contextMessageToSessionUpdates(
 /** Keep established envelopes intact; wrap only otherwise unmarked context. */
 export function formatContextNotification(text: string, origin: ContextMessage['origin']): string {
   if (origin?.kind === 'shell_command') return text;
-  const paseo = formatPaseoSystemNotification(text);
-  if (paseo !== undefined) return paseo;
   if (origin === undefined || origin.kind === 'user') return text;
   const trimmed = text.trim();
   const envelope = /^<([a-z][a-z0-9-]*)(?:\s[^<>]*)?>[\s\S]*<\/\1>$/i;
@@ -616,20 +611,6 @@ export function formatContextNotification(text: string, origin: ContextMessage['
       category = 'system'; type = 'system.retry'; title = 'Retry'; break;
   }
   return `<notification category="${escapeNotificationXml(category)}" type="${escapeNotificationXml(type)}">\nTitle: ${escapeNotificationXml(title)}\n\n${escapeNotificationXml(text)}\n</notification>`;
-}
-
-/** Only legacy system envelopes are hidden by Paseo; versioned agent messages
- * already have a native projection and must keep their provenance intact. */
-export function formatPaseoSystemNotification(text: string): string | undefined {
-  const envelope = /^<paseo-system>\n([\s\S]*)\n<\/paseo-system>$/.exec(text);
-  if (!envelope) return undefined;
-  const body = envelope[1]!;
-  const schedule = /^Schedule(?: "([^\n]*)")? fired \(id=([^\s,()]+), run=([^\s,()]+)\)\.\n([\s\S]+)$/.exec(body);
-  if (schedule) {
-    const name = schedule[1] === undefined ? '' : ` name="${escapeNotificationXml(schedule[1])}"`;
-    return `<cron-fire source="paseo" jobId="${escapeNotificationXml(schedule[2]!)}" runId="${escapeNotificationXml(schedule[3]!)}"${name}>\n<prompt>${escapeNotificationXml(body)}</prompt>\n</cron-fire>`;
-  }
-  return `<notification category="system" type="paseo.system" source="paseo">\nTitle: System notification\n\n${escapeNotificationXml(body)}\n</notification>`;
 }
 
 function escapeNotificationXml(text: string): string {
