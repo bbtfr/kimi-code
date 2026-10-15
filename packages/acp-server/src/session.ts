@@ -30,7 +30,7 @@ import type {
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
-import { createContextTranscriptReducer, type ContextMessage } from '@moonshot-ai/agent-core-v2';
+import { assistantStepMessageId, createContextTranscriptReducer, type ContextMessage } from '@moonshot-ai/agent-core-v2';
 import type {
   AgentEventPayloads,
   AgentHandle,
@@ -769,11 +769,11 @@ export class AcpSession {
   }
 
   private onAssistantDelta(event: AgentEventPayloads['assistant.delta']): void {
-    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event, this.stepId));
+    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event, assistantStepMessageId(this.stepId)));
   }
 
   private onThinkingDelta(event: AgentEventPayloads['thinking.delta']): void {
-    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event, this.stepId));
+    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event, assistantStepMessageId(this.stepId)));
   }
 
   private onToolCallStarted(event: AgentEventPayloads['tool.call.started']): void {

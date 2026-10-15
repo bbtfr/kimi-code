@@ -1,5 +1,3 @@
-import { randomUUID } from 'node:crypto';
-
 import { Disposable } from '#/_base/di/lifecycle';
 import { LifecycleScope } from '#/app/scopes';
 import { ScopeActivation, registerScopedService } from '#/_base/di/scope';
@@ -25,6 +23,7 @@ import {
 import { contextMemoryKey } from './contextOps';
 import type { LoopRecordedEvent } from './loopEventFold';
 import type { ContextMessage } from './types';
+import { newMessageId } from './messageId';
 
 export class AgentContextMemoryService extends Disposable implements IAgentContextMemoryService {
   declare readonly _serviceBrand: undefined;
@@ -60,7 +59,7 @@ export class AgentContextMemoryService extends Disposable implements IAgentConte
   append(...messages: readonly ContextMessage[]): void {
     if (messages.length === 0) return;
     const start = this.get().length;
-    const identified = messages.map((message) => ({ ...message, id: message.id ?? randomUUID() }));
+    const identified = messages.map((message) => ({ ...message, id: message.id ?? newMessageId() }));
     for (const message of identified) {
       void this.dispatcher.dispatch(
         new ContextAppendMessage({ agentId: this.scopeContext.agentId, message }),

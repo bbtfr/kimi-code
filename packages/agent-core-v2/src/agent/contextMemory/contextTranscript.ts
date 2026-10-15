@@ -40,6 +40,10 @@ interface MutableEntry {
   time?: number;
 }
 
+export function assistantStepMessageId(stepId: string | undefined): string | undefined {
+  return stepId === undefined ? undefined : `msg_${stepId}`;
+}
+
 export function reduceContextTranscript(records: Iterable<WireRecord>): ContextTranscript {
   const reducer = createContextTranscriptReducer();
   for (const record of records) reducer.add(record);
@@ -59,7 +63,7 @@ export function createContextTranscriptReducer(): ContextTranscriptReducer {
 
   const fold = createLoopEventFold({
     openAssistant: (time, stepId) => {
-      openEntry = { message: { id: stepId, role: 'assistant', content: [], toolCalls: [] }, time };
+      openEntry = { message: { id: assistantStepMessageId(stepId), role: 'assistant', content: [], toolCalls: [] }, time };
       push(openEntry);
     },
     appendOpenContent: (part) => {
