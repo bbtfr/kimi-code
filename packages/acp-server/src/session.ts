@@ -77,6 +77,7 @@ import {
   toolProgressToSessionUpdate,
   completedToolToSessionUpdate,
   contextMessageToSessionUpdates,
+  formatPaseoSystemNotification,
   legacyMessageId,
   turnEndReasonToStopReason,
   usageUpdateNotification,
@@ -282,7 +283,10 @@ export class AcpSession {
     this.subscriptions.push(
       events.on('context.append_message', (event) => {
         const message = event.message as ContextMessage;
-        if (message.origin?.kind === 'user' && !message.origin.inTurn) return;
+        if (message.origin?.kind === 'user' && !message.origin.inTurn) {
+          const text = message.content.filter(p => p.type === 'text').map(p => p.text).join('');
+          if (formatPaseoSystemNotification(text) === undefined) return;
+        }
         this.dispatchTurnEvent(this.activeTurnId ?? -1, () => {
           for (const update of contextMessageToSessionUpdates(this.sessionId, message, legacyMessageId(message, event.time))) this.emit(update);
         });

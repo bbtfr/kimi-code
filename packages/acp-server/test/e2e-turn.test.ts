@@ -130,6 +130,27 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     expect(usageUpdate?.cost).toBeUndefined();
   }, 30_000);
 
+  it('echoes converted Paseo schedule prompts live and identically after cold load', async () => {
+    let c = await boot();
+    scripted!.mockNextText('schedule received');
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const text = '<paseo-system>\nSchedule "Check" fired (id=s1, run=r1).\nCheck <file> & report.\n</paseo-system>';
+    await c.send('session/prompt', { sessionId: created.sessionId, prompt: [{ type: 'text', text }] });
+    const live = c.sessionUpdates().map(m => (m.params as SessionNotification).update)
+      .filter(u => u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text' && u.content.text.startsWith('<cron-fire'));
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ content: { text: expect.stringContaining('Check &lt;file&gt; &amp; report.') } });
+    await c.close();
+    client = undefined;
+    c = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    client = c;
+    await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await c.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    const replay = c.sessionUpdates().map(m => (m.params as SessionNotification).update)
+      .filter(u => u.sessionUpdate === 'agent_message_chunk' && u.content.type === 'text' && u.content.text.startsWith('<cron-fire'));
+    expect(replay).toEqual(live);
+  }, 30_000);
+
   it('keeps Edit diffs through completion and a cold session/load', async () => {
     let c = await boot();
     const path = join(homeDir!, 'edit.txt');
@@ -316,7 +337,7 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     await c.waitForSessionUpdate('usage_update', 10_000);
     const updates = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
     expect(updates).toContainEqual(expect.objectContaining({
-      sessionUpdate: 'user_message_chunk', content: expect.objectContaining({ text: expect.stringMatching(/^\[Cron\]\n/) }),
+      sessionUpdate: 'user_message_chunk', content: expect.objectContaining({ text: expect.stringMatching(/^<cron-fire\s/) }),
       _meta: expect.objectContaining({ origin: expect.objectContaining({ kind: 'cron_job' }) }),
     }));
     expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'agent_thought_chunk' }));
@@ -370,7 +391,7 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     await loop.settled();
     await new Promise(resolve => setTimeout(resolve, 20));
     const updates = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
-    expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: '[Task · completed]\nBACKGROUND_COMPLETION_BODY' } }));
+    expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: expect.stringMatching(/^<notification[^>]*>\nTitle: Background task completed\n\nBACKGROUND_COMPLETION_BODY\n<\/notification>$/) } }));
     expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'user_message_chunk', _meta: expect.objectContaining({ origin: { kind: 'system_trigger', name: 'goal_continuation' } }) }));
     expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'tool_call_update', status: 'failed' }));
     await c.close();

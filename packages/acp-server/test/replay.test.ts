@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { contextMessageToSessionUpdates, formatContextNotification } from '../src/events-map';
 import { projectHistoryToSessionUpdates } from '../src/replay';
 
 import type { SessionNotification } from '@agentclientprotocol/sdk';
@@ -125,5 +126,61 @@ describe('projectHistoryToSessionUpdates', () => {
       .filter((u) => u.update.sessionUpdate === 'tool_call')
       .map((u) => (u.update as { toolCallId: string }).toolCallId);
     expect(ids).toEqual(['1:a', '2:b']);
+  });
+});
+
+
+describe('context notification envelopes', () => {
+  it('preserves existing envelopes and tagged skill instructions byte for byte', () => {
+    for (const text of ['<notification type="task.completed">Title: Done\na < b & c</notification>', '<cron-fire jobId="1"><prompt>a & b</prompt></cron-fire>', '<system-reminder>Today</system-reminder>', 'Skill loaded.\n<skill-loaded name="example">Instructions</skill-loaded>']) {
+      expect(formatContextNotification(text, { kind: 'injection', variant: 'example' })).toBe(text);
+    }
+  });
+  it('does not wrap user or shell content', () => {
+    for (const text of ['hello & goodbye', '<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>']) {
+      expect(formatContextNotification(text, { kind: 'user' })).toBe(text);
+      expect(formatContextNotification(text, { kind: 'shell_command', phase: 'output' })).toBe(text);
+      expect(formatContextNotification(text, undefined)).toBe(text);
+    }
+  });
+  it('escapes bare notifications without mutating their persisted messages', () => {
+    const message: ContextMessage = { role: 'user', content: [{ type: 'text', text: 'a < b & </notification>' }], toolCalls: [], origin: { kind: 'system_trigger', name: 'goal_continuation' } };
+    const before = JSON.stringify(message);
+    const expected = '<notification category="goal" type="goal.continuation">\nTitle: Continue active goal\n\na &lt; b &amp; &lt;/notification&gt;\n</notification>';
+    expect(formatContextNotification(message.content[0]!.type === 'text' ? message.content[0]!.text : '', message.origin)).toBe(expected);
+    expect(projectHistoryToSessionUpdates(SESSION_ID, [message])[0]?.update).toMatchObject({ content: { type: 'text', text: expected } });
+    expect(JSON.stringify(message)).toBe(before);
+  });
+  it('wraps unmarked summaries, plugin commands, hooks, missed cron and retries', () => {
+    const origins: NonNullable<ContextMessage['origin']>[] = [
+      { kind: 'compaction_summary' }, { kind: 'cron_missed', count: 1 },
+      { kind: 'plugin_command', activationId: 'a', pluginId: 'example', commandName: 'check', trigger: 'user-slash' },
+      { kind: 'hook_result', event: 'Stop' }, { kind: 'retry' },
+    ];
+    for (const origin of origins) expect(formatContextNotification('original body', origin)).toMatch(/^<notification .*original body\n<\/notification>$/s);
+  });
+});
+
+
+describe('Paseo system notification presentation', () => {
+  it('shares conversion between live context and replay without changing model history', () => {
+    for (const origin of [undefined, { kind: 'user' as const }, { kind: 'injection' as const, variant: 'test' }]) {
+      const text = '<paseo-system>\nSchedule "A & B" fired (id=schedule-1, run=run-1).\nRead <file> & report.\n</paseo-system>';
+      const message: ContextMessage = { id: 'schedule-message', role: 'user', origin, content: [{ type: 'text', text }], toolCalls: [] };
+      const before = JSON.stringify(message);
+      const live = contextMessageToSessionUpdates(SESSION_ID, message, 'fallback');
+      expect(projectHistoryToSessionUpdates(SESSION_ID, [message])).toEqual(live);
+      expect(live[0]?.update).toMatchObject({ content: { text: '<cron-fire source="paseo" jobId="schedule-1" runId="run-1" name="A &amp; B">\n<prompt>Schedule &quot;A &amp; B&quot; fired (id=schedule-1, run=run-1).\nRead &lt;file&gt; &amp; report.</prompt>\n</cron-fire>' } });
+      expect(JSON.stringify(message)).toBe(before);
+    }
+  });
+  it('falls back for unknown legacy notifications and preserves versioned/user/shell envelopes', () => {
+    const raw = '<paseo-system>\nUnknown & <event>\n</paseo-system>';
+    expect(formatContextNotification(raw, { kind: 'user' })).toBe('<notification category="system" type="paseo.system" source="paseo">\nTitle: System notification\n\nUnknown &amp; &lt;event&gt;\n</notification>');
+    expect(formatContextNotification(raw, { kind: 'shell_command', phase: 'output' })).toBe(raw);
+    for (const text of ['<paseo-system version="1" kind="agent-message" message-id="id">\nhello\n</paseo-system>', 'Example: ' + raw, '<paseo-system>incomplete', 'Answers to your questions:\n\nQuestion?\nAnswer']) {
+      expect(formatContextNotification(text, { kind: 'user' })).toBe(text);
+    }
+    expect(formatContextNotification('<paseo-system>\nSchedule fired (id=s1, run=r1).\ncheck\n</paseo-system>', undefined)).toContain('<cron-fire source="paseo" jobId="s1" runId="r1">');
   });
 });
