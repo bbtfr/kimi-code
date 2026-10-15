@@ -94,6 +94,7 @@ export type ContextApplyCompactionPayload = z.infer<typeof contextApplyCompactio
 
 export class ContextApplyCompaction extends AgentEvent2<ContextApplyCompactionPayload> {
   static override readonly type = 'context.apply_compaction';
+  static override readonly observable = true;
   static override readonly durable = true;
   static override readonly schema = contextApplyCompactionSchema;
 }

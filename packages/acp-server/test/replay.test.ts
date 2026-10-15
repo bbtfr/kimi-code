@@ -131,6 +131,11 @@ describe('projectHistoryToSessionUpdates', () => {
 
 
 describe('context notification envelopes', () => {
+  it('keeps notifications with unknown persisted origins readable', () => {
+    const message: ContextMessage = JSON.parse(JSON.stringify({ role: 'user', content: [{ type: 'text', text: 'future notification' }], toolCalls: [], origin: { kind: 'future_event' } }));
+    expect(formatContextNotification('future notification', message.origin)).toBe('future notification');
+    expect(projectHistoryToSessionUpdates(SESSION_ID, [message])[0]?.update).toMatchObject({ content: { text: 'future notification' } });
+  });
   it('preserves existing envelopes and tagged skill instructions byte for byte', () => {
     for (const text of ['<notification type="task.completed">Title: Done\na < b & c</notification>', '<cron-fire jobId="1"><prompt>a & b</prompt></cron-fire>', '<system-reminder>Today</system-reminder>', 'Skill loaded.\n<skill-loaded name="example">Instructions</skill-loaded>']) {
       expect(formatContextNotification(text, { kind: 'injection', variant: 'example' })).toBe(text);

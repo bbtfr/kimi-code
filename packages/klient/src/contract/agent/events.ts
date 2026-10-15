@@ -33,6 +33,11 @@ export const contextAppendMessageEventSchema = z.object({
   message: z.unknown(),
 });
 
+export const contextApplyCompactionEventSchema = z.looseObject({
+  type: z.literal('context.apply_compaction'),
+  time: z.number(),
+});
+
 export const turnStepStartedEventSchema = z.object({
   type: z.literal('turn.step.started'),
   turnId: z.number(),
@@ -223,6 +228,7 @@ export const agentStatusUpdatedEventSchema = z.looseObject({
 /** Public event name → payload type. Keys must stay in sync with `agentEvents`. */
 export interface AgentEventPayloads {
   'context.append_message': z.infer<typeof contextAppendMessageEventSchema>;
+  'context.apply_compaction': z.infer<typeof contextApplyCompactionEventSchema>;
   'turn.step.started': z.infer<typeof turnStepStartedEventSchema>;
   'turn.started': z.infer<typeof turnStartedEventSchema>;
   'turn.ended': z.infer<typeof turnEndedEventSchema>;
@@ -249,6 +255,7 @@ export type AgentEventName = keyof AgentEventPayloads;
 
 /** Public event name → stream binding + payload schema. */
 export const agentEvents = {
+  'context.apply_compaction': { kind: 'stream', name: 'events', type: 'context.apply_compaction', schema: contextApplyCompactionEventSchema },
   'context.append_message': { kind: 'stream', name: 'events', type: 'context.append_message', schema: contextAppendMessageEventSchema },
   'turn.step.started': { kind: 'stream', name: 'events', type: 'turn.step.started', schema: turnStepStartedEventSchema },
   'turn.started': { kind: 'stream', name: 'events', type: 'turn.started', schema: turnStartedEventSchema },

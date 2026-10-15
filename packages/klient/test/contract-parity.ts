@@ -1,4 +1,4 @@
-import type { ContextAppendMessage } from '@moonshot-ai/agent-core-v2/agent/contextMemory/contextEvents';
+import type { ContextAppendMessage, ContextApplyCompaction } from '@moonshot-ai/agent-core-v2/agent/contextMemory/contextEvents';
 /**
  * Compile-time parity checks between klient wire schemas and the engine
  * types they mirror. Plain `.ts` (not `.test.ts`) — vitest must not pick it
@@ -214,6 +214,7 @@ import {
   turnStartedEventSchema,
   turnStepStartedEventSchema,
   contextAppendMessageEventSchema,
+  contextApplyCompactionEventSchema,
   warningEventSchema,
 } from '../src/contract/agent/events.js';
 import {
@@ -702,6 +703,7 @@ const _fullCompactionInput: AssertWire<typeof fullCompactionInputSchema, FullCom
 // `{ type, ... }` events; schemas keep the `type` literal). One-directional
 // where a field is mirrored as `unknown`.
 const _contextAppendMessageEvent: AssertEngineToWire<typeof contextAppendMessageEventSchema, Omit<ContextAppendMessage, 'type'> & { type: 'context.append_message' }> = true;
+const _contextApplyCompactionEvent: AssertEngineToWire<typeof contextApplyCompactionEventSchema, Omit<ContextApplyCompaction, 'type'> & { type: 'context.apply_compaction' }> = true;
 const _turnStepStartedEvent: AssertWire<typeof turnStepStartedEventSchema, TurnStepStartedEvent> = true;
 const _turnStartedEvent: AssertEngineToWire<typeof turnStartedEventSchema, TurnStartedEvent> = true;
 const _turnEndedEvent: AssertEngineToWire<typeof turnEndedEventSchema, TurnEndedEvent> = true;

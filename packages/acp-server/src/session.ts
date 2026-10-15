@@ -30,7 +30,7 @@ import type {
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
-import type { ContextMessage } from '@moonshot-ai/agent-core-v2';
+import { createContextTranscriptReducer, type ContextMessage } from '@moonshot-ai/agent-core-v2';
 import type {
   AgentEventPayloads,
   AgentHandle,
@@ -285,6 +285,15 @@ export class AcpSession {
         if (message.origin?.kind === 'user' && !message.origin.inTurn) return;
         this.dispatchTurnEvent(this.activeTurnId ?? -1, () => {
           for (const update of contextMessageToSessionUpdates(this.sessionId, message, legacyMessageId(message, event.time))) this.emit(update);
+        });
+      }),
+      events.on('context.apply_compaction', (event) => {
+        this.dispatchTurnEvent(this.activeTurnId ?? -1, () => {
+          const reducer = createContextTranscriptReducer();
+          reducer.add(event);
+          for (const message of reducer.result().entries) {
+            for (const update of contextMessageToSessionUpdates(this.sessionId, message, legacyMessageId(message, event.time))) this.emit(update);
+          }
         });
       }),
       events.on('turn.step.started', (event) => {

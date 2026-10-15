@@ -609,6 +609,8 @@ export function formatContextNotification(text: string, origin: ContextMessage['
       category = 'command'; type = 'command.activation'; title = `${origin.pluginId}:${origin.commandName}`; break;
     case 'retry':
       category = 'system'; type = 'system.retry'; title = 'Retry'; break;
+    default:
+      return text;
   }
   return `<notification category="${escapeNotificationXml(category)}" type="${escapeNotificationXml(type)}">\nTitle: ${escapeNotificationXml(title)}\n\n${escapeNotificationXml(text)}\n</notification>`;
 }

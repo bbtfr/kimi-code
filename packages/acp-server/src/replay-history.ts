@@ -12,6 +12,7 @@ import type { ToolResultEvent } from '@moonshot-ai/agent-core-v2/events';
 import type { ToolCallStartedEvent } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
 import type { ToolInputDisplay } from '@moonshot-ai/agent-core-v2/tool/toolInputDisplay';
 import type { AcpHistory } from './replay';
+import { legacyMessageId } from './events-map';
 
 /** Read the active journal branch, retaining persisted display semantics across compaction. */
 export async function readAcpHistory(core: Scope, sessionId: string): Promise<AcpHistory> {
@@ -50,8 +51,10 @@ export async function readAcpHistory(core: Scope, sessionId: string): Promise<Ac
     });
   }
   const blobs = agent.accessor.get(IAgentBlobService);
-  const messages = await Promise.all(reducer.result().entries.map(async (message) => ({
+  const transcript = reducer.result();
+  const messages = await Promise.all(transcript.entries.map(async (message, index) => ({
     ...message,
+    id: message.id ?? legacyMessageId(message, transcript.times[index] ?? index),
     content: [...await blobs.loadParts(message.content)],
   })));
   for (const [id, result] of toolResults) {

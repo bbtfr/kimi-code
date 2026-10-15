@@ -1118,6 +1118,17 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     expect(completion).toContain('Messages compacted:');
     expect(completion).toContain('Tokens before:');
     expect(completion).toContain('Tokens after:');
+    const summaries = (connection: TestClient) => connection.sessionUpdates()
+      .map(m => (m.params as SessionNotification).update)
+      .filter(u => u.sessionUpdate === 'user_message_chunk' && u.content.type === 'text' && u.content.text.includes('type="context.compaction"'));
+    const live = summaries(c);
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ content: { text: expect.stringContaining('compaction summary') } });
+    await c.close();
+    client = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await client.send('session/load', { sessionId, cwd: homeDir, mcpServers: [] });
+    expect(summaries(client)).toEqual(live);
   }, 30_000);
 
   /**

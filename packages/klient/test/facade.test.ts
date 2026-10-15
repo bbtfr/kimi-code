@@ -642,6 +642,7 @@ describe('event hub', () => {
     const agent = klient.session('s1').agent('main');
     const seen = {
       context: [] as unknown[],
+      compactedContext: [] as unknown[],
       step: [] as unknown[],
       delta: [] as unknown[],
       progress: [] as unknown[],
@@ -656,6 +657,7 @@ describe('event hub', () => {
     });
 
     agent.events.on('context.append_message', (event) => seen.context.push(event));
+    agent.events.on('context.apply_compaction', (event) => seen.compactedContext.push(event));
     agent.events.on('turn.step.started', (event) => seen.step.push(event));
     agent.events.on('tool.call.delta', (event) => seen.delta.push(event));
     agent.events.on('tool.progress', (event) => seen.progress.push(event));
@@ -686,6 +688,8 @@ describe('event hub', () => {
     };
     const context = { type: 'context.append_message', time: 1, message: { id: 'notice', role: 'user', content: [{ type: 'text', text: 'task done' }] } };
     const step = { type: 'turn.step.started', turnId: 1, step: 0, stepId: 'step-id' };
+    const compactedContext = { type: 'context.apply_compaction', time: 2, summary: 'summary body', compactedCount: 3 };
+    channel.emit(0, compactedContext);
     channel.emit(0, context);
     channel.emit(0, step);
     channel.emit(0, delta);
@@ -699,6 +703,7 @@ describe('event hub', () => {
     await tick();
 
     expect(seen.context).toEqual([context]);
+    expect(seen.compactedContext).toEqual([compactedContext]);
     expect(seen.step).toEqual([step]);
     expect(seen.delta).toEqual([delta]);
     expect(seen.progress).toEqual([progress]);
