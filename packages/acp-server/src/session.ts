@@ -1007,7 +1007,14 @@ export class AcpSession {
     const driver = this.driverFor(event.turnId);
     if (driver === undefined) {
       const error = event.error as { message?: string } | undefined;
-      if (event.reason === 'failed') this.emitLocalChunk(error?.message ?? 'The background turn failed.');
+      if (event.reason === 'failed') {
+        this.emitLocalNotice({
+          category: 'system',
+          type: 'turn.failed',
+          name: 'Turn failed',
+          body: error?.message ?? 'The background turn failed.',
+        });
+      }
       void this.emitUsageUpdate();
       return;
     }
