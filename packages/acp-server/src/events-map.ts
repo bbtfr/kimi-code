@@ -1,4 +1,5 @@
 import { createHash } from 'node:crypto';
+import { RequestError } from '@agentclientprotocol/sdk';
 import type { ContextMessage } from '@moonshot-ai/agent-core-v2';
 import { isAbsolute } from 'node:path';
 
@@ -52,10 +53,9 @@ export function assistantDeltaToSessionUpdate(
  *
  * `completed` → `end_turn`: the model finished a clean turn.
  * `cancelled` → `cancelled`: the client/agent cancelled mid-turn.
- * `failed`    → `end_turn` (with the out-of-band `error` logged by the
- *   caller). ACP's `StopReason` has no dedicated `failed` variant in this
- *   protocol version, and the spec discourages signaling errors through
- *   `stopReason` (errors belong on the JSON-RPC error channel).
+ * `failed` throws a JSON-RPC error: `auth_required` for authentication
+ *   failures, `internalError` otherwise. ACP has no failed stop reason;
+ *   callers must reject the prompt request with this error.
  * `failed` + `provider.filtered` → `refusal`: the provider's safety policy
  *   blocked the response.
  * `blocked`   → `refusal`: a prompt hook blocked the turn before the model
@@ -64,7 +64,7 @@ export function assistantDeltaToSessionUpdate(
  */
 export function turnEndReasonToStopReason(
   reason: TurnEndReason,
-  error?: { readonly code: string },
+  error?: { readonly code: string; readonly message?: string },
 ): AcpStopReason {
   switch (reason) {
     case 'completed':
@@ -73,7 +73,11 @@ export function turnEndReasonToStopReason(
       return 'cancelled';
     case 'failed':
       if (error?.code === 'provider.filtered') return 'refusal';
-      return 'end_turn';
+      if (isAuthError(error)) throw RequestError.authRequired(undefined, error?.message);
+      throw RequestError.internalError(
+        { code: error?.code },
+        error?.message ?? 'The agent turn failed.',
+      );
     case 'blocked':
       return 'refusal';
   }

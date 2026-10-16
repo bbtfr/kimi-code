@@ -19,6 +19,7 @@ import type { SessionNotification } from '@agentclientprotocol/sdk';
 import { ToolProgress } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { turnEndReasonToStopReason } from '../src/events-map';
 import { mapPromptLaunchError } from '../src/session';
 import { createTestClient, type TestClient } from './_helpers/acpClient';
 import { writeFakeModelConfig } from './_helpers/fakeModelConfig';
@@ -91,6 +92,65 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     if (clientCapabilities['terminal'] === true) installTerminalClient(client);
     return client;
   }
+
+  it('reports exhausted 429 retries as a JSON-RPC error and accepts the next prompt', async () => {
+    vi.stubEnv('KIMI_LOOP_MAX_ATTEMPTS_PER_STEP', '3');
+    const c = await boot();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      scripted!.mockNextProviderResponse({ error: {
+        kind: 'rate_limit', message: '429 engine overloaded', statusCode: 429,
+        requestId: null, retryAfterMs: 1, headers: null,
+      } });
+    }
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    await expect(c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'start' }],
+    })).rejects.toThrow('429 engine overloaded');
+    expect(scripted!.callCount()).toBe(3);
+    expect(c.received.filter(m => m.error !== undefined)).toMatchObject([{
+      error: { code: -32603, data: { code: 'provider.rate_limit' } },
+    }]);
+    scripted!.mockNextText('recovered');
+    await expect(c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'try again' }],
+    })).resolves.toMatchObject({ stopReason: 'end_turn' });
+    expect(scripted!.callCount()).toBe(4);
+  }, 30_000);
+
+  it('preserves partial output but reports a terminal connection failure', async () => {
+    vi.stubEnv('KIMI_LOOP_MAX_ATTEMPTS_PER_STEP', '1');
+    const c = await boot();
+    scripted!.mockNextProviderResponse({
+      parts: [{ type: 'text', text: 'partial answer' }],
+      error: { kind: 'connection', message: 'Connection closed unexpectedly' },
+    });
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    await expect(c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'start' }],
+    })).rejects.toThrow('Connection closed unexpectedly');
+    expect(c.sessionUpdates().map(m => (m.params as SessionNotification).update)).toContainEqual(
+      expect.objectContaining({ sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'partial answer' } }),
+    );
+    expect(c.received.filter(m => m.error !== undefined)).toMatchObject([{
+      error: { code: -32603, data: { code: 'provider.connection_error' } },
+    }]);
+  }, 30_000);
+
+  it('does not report a transient failure when a retry succeeds', async () => {
+    vi.stubEnv('KIMI_LOOP_MAX_ATTEMPTS_PER_STEP', '2');
+    const c = await boot();
+    scripted!.mockNextProviderResponse({ error: {
+      kind: 'rate_limit', message: 'try later', statusCode: 429,
+      requestId: null, retryAfterMs: 1, headers: null,
+    } });
+    scripted!.mockNextText('retry succeeded');
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    await expect(c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'start' }],
+    })).resolves.toMatchObject({ stopReason: 'end_turn' });
+    expect(scripted!.callCount()).toBe(2);
+    expect(c.received.filter(m => m.error !== undefined)).toEqual([]);
+  }, 30_000);
 
   it('drives initialize → new → prompt and streams the assistant text as agent_message_chunk', async () => {
     const c = await boot();
@@ -1208,16 +1268,15 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     expect(await waitForChunk(c, 'recovered reply')).toBeTruthy();
   }, 30_000);
 
-  it('a non-retryable provider failure ends the turn with a failure notification envelope', async () => {
+  it('a non-retryable provider failure rejects the prompt and emits a failure notification envelope', async () => {
     const c = await boot();
     const sessionId = await newSession(c);
 
     scripted!.mockNextError({ message: 'bad request: model rejected the input', statusCode: 400 });
-    const result = (await c.send('session/prompt', {
+    await expect(c.send('session/prompt', {
       sessionId,
       prompt: [{ type: 'text', text: 'hi' }],
-    })) as { stopReason: string };
-    expect(result.stopReason).toBe('end_turn');
+    })).rejects.toThrow('bad request: model rejected the input');
 
     const notice = await waitForChunk(c, 'turn.failed');
     expect(notice).toContain('<notification source="kimi" category="system"');
@@ -1437,4 +1496,33 @@ describe('acp-server terminal reverse-RPC (clientCapabilities.terminal)', () => 
     const text = completed?.content?.map((entry) => entry.content?.text ?? '').join('\n') ?? '';
     expect(text).toContain('hello_from_bash');
   }, 30_000);
+});
+
+describe('ACP turn outcome mapping', () => {
+  it.each([
+    ['completed', undefined, 'end_turn'],
+    ['cancelled', undefined, 'cancelled'],
+    ['blocked', undefined, 'refusal'],
+    ['failed', { code: 'provider.filtered' }, 'refusal'],
+  ] as const)('keeps %s as a stop reason', (reason, error, expected) => {
+    expect(turnEndReasonToStopReason(reason, error)).toBe(expected);
+  });
+
+  it.each([
+    { code: 'provider.rate_limit', message: '429 engine overloaded' },
+    { code: 'provider.connection_error', message: 'Connection timed out' },
+    { code: 'provider.api_error', message: '503 Service unavailable' },
+    { code: 'context.overflow', message: 'Context is too long' },
+    { code: 'unknown.failure', message: 'Unexpected failure' },
+    undefined,
+  ])('rejects failed turns instead of claiming end_turn: %j', (error) => {
+    expect(() => turnEndReasonToStopReason('failed', error)).toThrow(
+      expect.objectContaining({ code: -32603, message: expect.stringContaining(error?.message ?? 'The agent turn failed.') }),
+    );
+  });
+
+  it('preserves auth_required for authentication failures', () => {
+    expect(() => turnEndReasonToStopReason('failed', { code: 'provider.auth_error', message: 'Please sign in' }))
+      .toThrow(expect.objectContaining({ code: -32000 }));
+  });
 });

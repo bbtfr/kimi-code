@@ -30,7 +30,7 @@ import {
   type Tool,
 } from '@moonshot-ai/agent-core-v2';
 import type { FinishReason } from '@moonshot-ai/agent-core-v2/human/llm/finish-reason';
-import type { LlmErrorMessage } from '@moonshot-ai/agent-core-v2/human/llm/errors';
+import type { LlmRemoteErrorMessage } from '@moonshot-ai/agent-core-v2/human/llm/errors';
 import { fromLlmMessage } from '@moonshot-ai/agent-core-v2/llm-adapter/contract/message';
 import type { LlmRequester } from '@moonshot-ai/agent-core-v2/human/llm/requester/requester';
 
@@ -41,17 +41,11 @@ interface ScriptedLlmFailure {
   readonly retryAfterMs?: number;
 }
 
-class ScriptedLlmError extends Error {
-  constructor(readonly llmError: LlmErrorMessage<'status'>) {
-    super(llmError.message);
-  }
-}
-
 interface ScriptedResponse {
   readonly parts: readonly StreamedMessagePart[];
   readonly finishReason?: FinishReason | null;
   readonly rawFinishReason?: string | null;
-  readonly error?: ScriptedLlmFailure;
+  readonly error?: LlmRemoteErrorMessage;
 }
 
 const ZERO_USAGE: TokenUsage = {
@@ -78,6 +72,10 @@ class ScriptedStream {
     private readonly response: ScriptedResponse,
     private readonly index: number,
   ) {}
+
+  get error(): LlmRemoteErrorMessage | undefined {
+    return this.response.error;
+  }
 
   async *[Symbol.asyncIterator](): AsyncIterator<StreamedMessagePart> {
     for (const part of this.parts) {
@@ -117,16 +115,6 @@ class ScriptedChatProvider {
           `queue exhausted. Push another response via mockNextResponse().`,
       );
     }
-    if (response.error !== undefined) {
-      throw new ScriptedLlmError({
-        kind: 'status',
-        message: response.error.message,
-        statusCode: response.error.statusCode,
-        requestId: null,
-        retryAfterMs: response.error.retryAfterMs ?? null,
-        headers: null,
-      });
-    }
     this.calls.push(history);
     return new ScriptedStream(response.parts, response, this.calls.length);
   }
@@ -152,6 +140,7 @@ export interface ScriptedProvider {
     readonly parts?: readonly StreamedMessagePart[];
     readonly finishReason?: FinishReason | null;
     readonly rawFinishReason?: string | null;
+    readonly error?: LlmRemoteErrorMessage;
   }): void;
   /** Push a provider failure (retryable `status` kind, e.g. a 429). */
   mockNextError(error: ScriptedLlmFailure): void;
@@ -181,6 +170,10 @@ export function createScriptedProvider(): ScriptedProvider {
           control.onEvent?.({ type: 'llm.streaming.part', part });
           control.signal.throwIfAborted();
         }
+        if (stream.error !== undefined) {
+          control.onEvent?.({ type: 'llm.failed.remote', error: stream.error });
+          return;
+        }
         control.onEvent?.({ type: 'llm.streaming.usage', usage: stream.usage ?? ZERO_USAGE });
         control.onEvent?.({
           type: 'llm.streaming.finish',
@@ -196,13 +189,10 @@ export function createScriptedProvider(): ScriptedProvider {
       } catch (error) {
         control.onEvent?.({
           type: 'llm.failed.remote',
-          error:
-            error instanceof ScriptedLlmError
-              ? error.llmError
-              : {
-                  kind: 'unknown',
-                  message: error instanceof Error ? error.message : String(error),
-                },
+          error: {
+            kind: 'unknown',
+            message: error instanceof Error ? error.message : String(error),
+          },
         });
       }
     },
@@ -237,10 +227,14 @@ export function createScriptedProvider(): ScriptedProvider {
         parts: structuredClone(response.parts ?? []),
         finishReason: response.finishReason,
         rawFinishReason: response.rawFinishReason,
+        error: response.error !== undefined ? { ...response.error } : undefined,
       });
     },
     mockNextError: (error) => {
-      queue.push({ parts: [], error: { ...error } });
+      queue.push({ parts: [], error: {
+        kind: 'status', message: error.message, statusCode: error.statusCode,
+        requestId: null, retryAfterMs: error.retryAfterMs ?? null, headers: null,
+      } });
     },
     callCount: () => calls.length,
     callHistory: () => calls,

@@ -1049,13 +1049,13 @@ export class AcpSession {
       });
     }
     this.settleDriver(driver, () => {
-      // Auth failures must surface as a JSON-RPC `auth_required` error
-      // so the client triggers its re-auth flow, not a silent `end_turn`.
-      if (event.reason === 'failed' && isAuthError(error)) {
-        driver.reject(RequestError.authRequired(undefined, error?.message));
-        return;
+      // turnEndReasonToStopReason throws a JSON-RPC error for failed turns
+      // (auth_required for auth failures, internalError otherwise).
+      try {
+        driver.resolve({ stopReason: turnEndReasonToStopReason(event.reason, error) });
+      } catch (settleError) {
+        driver.reject(settleError);
       }
-      driver.resolve({ stopReason: turnEndReasonToStopReason(event.reason, error) });
     });
     void this.emitUsageUpdate();
   }
