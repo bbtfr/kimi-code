@@ -30,7 +30,7 @@ import type {
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
-import type { ContextMessage } from '@moonshot-ai/agent-core-v2';
+import { assistantStepMessageId, createContextTranscriptReducer, type ContextMessage } from '@moonshot-ai/agent-core-v2';
 import type {
   AgentEventPayloads,
   AgentHandle,
@@ -75,7 +75,9 @@ import {
   toolCallStartedUpgradeToSessionUpdate,
   toolCallStartToSessionUpdate,
   toolProgressToSessionUpdate,
-  toolResultToSessionUpdate,
+  completedToolToSessionUpdate,
+  contextMessageToSessionUpdates,
+  legacyMessageId,
   turnEndReasonToStopReason,
   usageUpdateNotification,
   isAuthError,
@@ -85,7 +87,8 @@ import { AcpInteractionBridge } from './interaction-bridge';
 import { log } from './log';
 import { projectModelCatalog } from './model-catalog';
 import { ACP_MODES, type AcpModeId, acpModeToToggles, DEFAULT_MODE_ID } from './modes';
-import { projectHistoryToSessionUpdates } from './replay';
+import { projectHistoryToSessionUpdates, type AcpHistory } from './replay';
+import { SystemMessageProjector } from './system-messages';
 import { buildAcpSkillSlashCommands, detectSlashIntent } from './slash';
 
 /** Leading text of the first text block, if any (used for slash detection). */
@@ -167,9 +170,8 @@ interface TurnDriver {
   cancelRequested?: boolean;
   /**
    * Turn-scoped events that arrived while `turnId` was still unknown. Once
-   * the launch resolves, the entries matching the driver's turn are replayed
-   * in arrival order; the rest (a still-draining prior turn) are dropped —
-   * the same verdict the live path would have given.
+   * the launch resolves, all entries are forwarded in arrival order; only
+   * the matching turn may settle the prompt.
    */
   early: Array<{ readonly turnId: number; readonly dispatch: () => void }>;
 }
@@ -194,6 +196,9 @@ export class AcpSession {
   private skills: readonly SkillSummary[] = [];
   /** The in-flight prompt's driver, if any. */
   private driver: TurnDriver | undefined;
+  private activeTurnId: number | undefined;
+  private readonly toolCalls = new Map<string, ToolCallStartedEvent>();
+  private stepId: string | undefined;
   /**
    * Abort markers of prompts still in their pre-turn image-compression phase
    * (no turn launched yet, so `agent.cancel` has nothing to cancel).
@@ -239,6 +244,9 @@ export class AcpSession {
   /** Bridges engine approval / ask-user requests to the ACP client. */
   private readonly interactionBridge: AcpInteractionBridge;
 
+  /** Legacy `<paseo-system>` projection + edit-result dedup (in-process). */
+  private readonly systemMessages: SystemMessageProjector;
+
   constructor(
     private readonly conn: AcpClient,
     klient: Klient,
@@ -259,12 +267,14 @@ export class AcpSession {
     private readonly hostCommands:
       | ReadonlyArray<AvailableCommand>
       | HostSlashCommandsSnapshot = [],
+    private readonly readHistory?: (sessionId: string) => Promise<AcpHistory>,
   ) {
     this.klient = klient;
     this.session = klient.session(sessionId);
     // `main` is auto-materialized by the transport's scope resolution on the
     // first call — no explicit agent bootstrap is needed here.
     this.agent = this.session.agent('main');
+    this.systemMessages = new SystemMessageProjector(sessionId);
     this.interactionBridge = new AcpInteractionBridge(conn, this.session, sessionId, elicitationForm);
   }
 
@@ -275,6 +285,29 @@ export class AcpSession {
   async init(): Promise<void> {
     const events = this.agent.events;
     this.subscriptions.push(
+      events.on('context.append_message', (event) => {
+        const message = event.message as ContextMessage;
+        if (message.origin?.kind === 'user' && !message.origin.inTurn) return;
+        this.dispatchTurnEvent(this.activeTurnId ?? -1, () => {
+          for (const update of contextMessageToSessionUpdates(this.sessionId, message, legacyMessageId(message, event.time))) this.emit(update);
+        });
+      }),
+      events.on('context.apply_compaction', (event) => {
+        this.dispatchTurnEvent(this.activeTurnId ?? -1, () => {
+          const reducer = createContextTranscriptReducer();
+          reducer.add(event);
+          for (const message of reducer.result().entries) {
+            for (const update of contextMessageToSessionUpdates(this.sessionId, message, legacyMessageId(message, event.time))) this.emit(update);
+          }
+        });
+      }),
+      events.on('turn.step.started', (event) => {
+        this.dispatchTurnEvent(event.turnId, () => { this.stepId = event.stepId; });
+      }),
+      events.on('turn.started', (event) => {
+        this.activeTurnId = event.turnId;
+        this.stepId = undefined;
+      }),
       events.on('assistant.delta', (event) => {
         this.dispatchTurnEvent(event.turnId, () => {
           this.onAssistantDelta(event);
@@ -306,6 +339,7 @@ export class AcpSession {
         });
       }),
       events.on('turn.ended', (event) => {
+        if (this.activeTurnId === event.turnId) this.activeTurnId = undefined;
         this.dispatchTurnEvent(event.turnId, () => {
           this.onTurnEnded(event);
         });
@@ -320,12 +354,47 @@ export class AcpSession {
         this.onCompactionCompleted(event);
       }),
       events.on('compaction.cancelled', () => {
-        this.emitLocalChunk('Compaction cancelled.');
+        this.emitLocalNotice({
+          category: 'context',
+          type: 'context.compaction',
+          name: 'Compaction',
+          body: 'Compaction cancelled.',
+        });
       }),
       events.on('compaction.blocked', () => {
-        this.emitLocalChunk(
-          'Compaction is blocked by the current turn; retry when the turn is idle.',
-        );
+        this.emitLocalNotice({
+          category: 'context',
+          type: 'context.compaction',
+          name: 'Compaction',
+          body: 'Compaction is blocked by the current turn; retry when the turn is idle.',
+        });
+      }),
+      // LLM retry (429 and other retryable failures) and engine warnings/errors
+      // are system notices, not model output — envelope them the same way.
+      events.on('turn.step.retrying', (event) => {
+        this.emitLocalNotice({
+          category: 'system',
+          type: 'llm.retrying',
+          name: 'LLM request retry',
+          title: `Retrying the LLM request (attempt ${event.nextAttempt} of ${event.maxAttempts})`,
+          body: `${event.errorMessage}${event.statusCode !== undefined ? ` (HTTP ${event.statusCode})` : ''}\nNext attempt in ${Math.max(1, Math.round(event.delayMs / 1000))}s.`,
+        });
+      }),
+      events.on('warning', (event) => {
+        this.emitLocalNotice({
+          category: 'system',
+          type: 'system.warning',
+          name: 'Warning',
+          body: event.code !== undefined ? `[${event.code}] ${event.message}` : event.message,
+        });
+      }),
+      events.on('error', (event) => {
+        this.emitLocalNotice({
+          category: 'system',
+          type: 'system.error',
+          name: 'Error',
+          body: event.message,
+        });
       }),
     );
     // Session-scope stream: title changes surface as `session_info_update`.
@@ -389,6 +458,7 @@ export class AcpSession {
         driver.resolve({ stopReason: 'cancelled' });
       });
     }
+    for (const notification of this.systemMessages.end()) this.emitRaw(notification);
     this.interactionBridge.dispose();
     for (const subscription of this.subscriptions.splice(0)) {
       subscription.dispose();
@@ -403,10 +473,16 @@ export class AcpSession {
    */
   async replayHistory(): Promise<void> {
     let messages: readonly ContextMessage[];
+    let toolCalls: AcpHistory['toolCalls'];
+    let toolResults: AcpHistory['toolResults'];
     try {
       // `history` items cross the wire as JSON-cloned `ContextMessage`s (the
       // facade types them via the engine RPC signature).
-      messages = (await this.agent.getContext()).history;
+      if (this.readHistory !== undefined) {
+        ({ messages, toolCalls, toolResults } = await this.readHistory(this.sessionId));
+      } else {
+        messages = (await this.agent.getContext()).history;
+      }
     } catch (error) {
       log.warn('acp: replayHistory could not read context memory', {
         sessionId: this.sessionId,
@@ -414,10 +490,10 @@ export class AcpSession {
       });
       return;
     }
-    const updates = projectHistoryToSessionUpdates(this.sessionId, messages);
+    const updates = projectHistoryToSessionUpdates(this.sessionId, messages, toolCalls, toolResults);
     for (const update of updates) {
       try {
-        await this.conn.sessionUpdate(update);
+        await this.conn.sessionUpdate(this.systemMessages.transformReplay(update));
       } catch (error) {
         // A single transient push failure must not truncate the whole replay;
         // log and continue so the rest of the history still lands.
@@ -479,6 +555,19 @@ export class AcpSession {
   }
 
   async prompt(blocks: readonly ContentBlock[]): Promise<PromptResponse> {
+    const pendingKey = this.systemMessages.onPrompt(blocks);
+    let response: PromptResponse;
+    try {
+      response = await this.promptInner(blocks);
+    } catch (error) {
+      for (const notification of this.systemMessages.onPromptSettled(pendingKey, false)) this.emitRaw(notification);
+      throw error;
+    }
+    for (const notification of this.systemMessages.onPromptSettled(pendingKey, true)) this.emitRaw(notification);
+    return response;
+  }
+
+  private async promptInner(blocks: readonly ContentBlock[]): Promise<PromptResponse> {
     // Slash-intent detection: builtin commands execute locally without an LLM
     // turn; skills activate through the engine (rendered skill prompt driven
     // as a normal turn); unknown slash commands are answered locally with an
@@ -629,7 +718,7 @@ export class AcpSession {
    * two concurrent prompts cannot race past the check.
    */
   private assertNoActiveTurn(): void {
-    if (this.driver !== undefined && !this.driver.settled) {
+    if (this.activeTurnId !== undefined || (this.driver !== undefined && !this.driver.settled)) {
       throw RequestError.invalidRequest(
         { code: TURN_AGENT_BUSY_CODE },
         'another turn is already in progress',
@@ -685,11 +774,10 @@ export class AcpSession {
               });
             });
           }
-          // Replay the events the turn emitted before its id arrived (a fast
-          // turn can outrun the launch round-trip — `activateSkill` returns
-          // only after the prompt-metadata update).
+          // Attribution is ready; forward all buffered session events, including
+          // autonomous turns, without allowing them to settle this prompt.
           for (const early of driver.early.splice(0)) {
-            if (early.turnId === driver.turnId) early.dispatch();
+            early.dispatch();
           }
         },
         (error) => {
@@ -715,13 +803,13 @@ export class AcpSession {
   }
 
   /**
-   * Settle the driver exactly once and detach it from the session so later
-   * events of its turn are ignored.
+   * Settle the prompt exactly once; session events keep streaming independently.
    */
   private settleDriver(driver: TurnDriver, action: () => void): void {
     if (driver.settled) return;
     driver.settled = true;
     if (this.driver === driver) this.driver = undefined;
+    for (const early of driver.early.splice(0)) early.dispatch();
     action();
   }
 
@@ -735,20 +823,18 @@ export class AcpSession {
   }
 
   private onAssistantDelta(event: AgentEventPayloads['assistant.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
-    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event));
+    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event, assistantStepMessageId(this.stepId)));
   }
 
   private onThinkingDelta(event: AgentEventPayloads['thinking.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
-    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event));
+    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event, assistantStepMessageId(this.stepId)));
   }
 
   private onToolCallStarted(event: AgentEventPayloads['tool.call.started']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolCallStartedEvent` (`args` / `display`
     // arrive as `unknown` — cast at this seam).
     const mapped = event as unknown as ToolCallStartedEvent;
+    this.toolCalls.set(acpToolCallId(event.turnId, event.toolCallId), mapped);
     const key = acpToolCallId(event.turnId, event.toolCallId);
     const locations = toolCallLocations(mapped.name, mapped.args, mapped.display);
     if (locations !== undefined) {
@@ -787,7 +873,6 @@ export class AcpSession {
   }
 
   private onToolCallDelta(event: AgentEventPayloads['tool.call.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolCallDeltaEvent` field-for-field.
     const mapped = event as unknown as ToolCallDeltaEvent;
     const key = acpToolCallId(event.turnId, event.toolCallId);
@@ -809,7 +894,6 @@ export class AcpSession {
   }
 
   private onToolProgress(event: AgentEventPayloads['tool.progress']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolProgressEvent` field-for-field; the
     // helper forwards only `status` updates with text (as a title refresh)
     // and returns null for everything else, which `emit` drops.
@@ -817,9 +901,10 @@ export class AcpSession {
   }
 
   private onToolResult(event: AgentEventPayloads['tool.result']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     const key = acpToolCallId(event.turnId, event.toolCallId);
     const locations = this.toolLocations.get(key);
+    const call = this.toolCalls.get(key);
+    this.toolCalls.delete(key);
     this.toolLocations.delete(key);
     this.bashCallsAwaitingTerminal.delete(key);
     this.toolCallStreamArgs.delete(key);
@@ -843,7 +928,7 @@ export class AcpSession {
       return;
     }
     this.emit(
-      toolResultToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, locations),
+      completedToolToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, call),
     );
   }
 
@@ -881,20 +966,44 @@ export class AcpSession {
    */
   private onCompactionStarted(event: AgentEventPayloads['compaction.started']): void {
     if (event.trigger !== 'auto') return;
-    this.emitLocalChunk(
-      event.instruction === undefined
-        ? 'Compacting conversation context…'
-        : `Compacting conversation context with instruction: ${event.instruction}`,
-    );
+    this.emitLocalNotice({
+      category: 'context',
+      type: 'context.compaction',
+      name: 'Compaction',
+      body:
+        event.instruction === undefined
+          ? 'Compacting conversation context…'
+          : `Compacting conversation context with instruction: ${event.instruction}`,
+    });
   }
 
   /** Report the compaction result (token/message summary). */
   private onCompactionCompleted(event: AgentEventPayloads['compaction.completed']): void {
-    this.emitLocalChunk(formatCompactionCompleted(event.result));
+    this.emitLocalNotice({
+      category: 'context',
+      type: 'context.compaction',
+      name: 'Compaction',
+      body: formatCompactionCompleted(event.result),
+    });
   }
 
-  /** Push one local `agent_message_chunk` (best-effort, never throws). */
-  private emitLocalChunk(text: string): void {
+  /**
+   * Push one local system notice as a single `agent_message_chunk` carrying a
+   * `<notification>` envelope (best-effort, never throws). The envelope marks
+   * the text as a system notification rather than model output, so clients
+   * that understand the convention (Paseo) render it as a notice instead of
+   * assistant text; other ACP clients keep showing the raw text.
+   */
+  private emitLocalNotice(input: {
+    category: string;
+    type: string;
+    name: string;
+    title?: string;
+    body: string;
+  }): void {
+    const text =
+      `<notification source="kimi" category="${input.category}" type="${input.type}" name="${input.name}">` +
+      `Title: ${input.title ?? input.name}\n${input.body}</notification>`;
     this.emit({
       sessionId: this.sessionId,
       update: {
@@ -905,17 +1014,48 @@ export class AcpSession {
   }
 
   private onTurnEnded(event: AgentEventPayloads['turn.ended']): void {
+    const prefix = `${event.turnId}:`;
+    for (const key of this.toolCallStreamArgs.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      this.toolCallStreamArgs.delete(key);
+      this.toolLocations.delete(key);
+      this.toolCalls.delete(key);
+      this.bashCallsAwaitingTerminal.delete(key);
+      this.terminalBackedCalls.delete(key);
+    }
     const driver = this.driverFor(event.turnId);
-    if (driver === undefined) return;
-    const error = event.error as { readonly code: string; readonly message?: string } | undefined;
-    this.settleDriver(driver, () => {
-      // Auth failures must surface as a JSON-RPC `auth_required` error
-      // so the client triggers its re-auth flow, not a silent `end_turn`.
-      if (event.reason === 'failed' && isAuthError(error)) {
-        driver.reject(RequestError.authRequired(undefined, error?.message));
-        return;
+    if (driver === undefined) {
+      const error = event.error as { message?: string } | undefined;
+      if (event.reason === 'failed') {
+        this.emitLocalNotice({
+          category: 'system',
+          type: 'turn.failed',
+          name: 'Turn failed',
+          body: error?.message ?? 'The background turn failed.',
+        });
       }
-      driver.resolve({ stopReason: turnEndReasonToStopReason(event.reason, error) });
+      void this.emitUsageUpdate();
+      return;
+    }
+    const error = event.error as { readonly code: string; readonly message?: string } | undefined;
+    // A failed turn otherwise settles as a plain `end_turn` with the error
+    // logged out-of-band — clients would never show what went wrong.
+    if (event.reason === 'failed' && error?.message !== undefined) {
+      this.emitLocalNotice({
+        category: 'system',
+        type: 'turn.failed',
+        name: 'Turn failed',
+        body: error.message,
+      });
+    }
+    this.settleDriver(driver, () => {
+      // turnEndReasonToStopReason throws a JSON-RPC error for failed turns
+      // (auth_required for auth failures, internalError otherwise).
+      try {
+        driver.resolve({ stopReason: turnEndReasonToStopReason(event.reason, error) });
+      } catch (settleError) {
+        driver.reject(settleError);
+      }
     });
     void this.emitUsageUpdate();
   }
@@ -962,7 +1102,7 @@ export class AcpSession {
   }
 
   /** Push a `session/update` notification (best-effort, never throws). */
-  private emit(notification: SessionNotification | null): void {
+  private emitRaw(notification: SessionNotification | null): void {
     if (notification === null) return;
     void this.conn.sessionUpdate(notification).catch((error) => {
       log.warn('acp: failed to push session/update', {
@@ -970,6 +1110,19 @@ export class AcpSession {
         error: error instanceof Error ? error.message : String(error),
       });
     });
+  }
+
+  /**
+   * Live emissions route through the system-message projector (legacy
+   * envelope projection, edit-result dedup, mirror injection). Projector
+   * output is already projected and must go through `emitRaw` — routing it
+   * back through `transform` would double-dedup repeated identical prompts.
+   */
+  private emit(notification: SessionNotification | null): void {
+    if (notification === null) return;
+    for (const projected of this.systemMessages.transform(notification)) {
+      this.emitRaw(projected);
+    }
   }
 
   /**
@@ -982,7 +1135,14 @@ export class AcpSession {
       pending.aborted = true;
     }
     const driver = this.driver;
-    if (driver === undefined || driver.settled) return;
+    if (driver === undefined || driver.settled) {
+      if (this.activeTurnId !== undefined) {
+        void this.agent.cancel({ turnId: this.activeTurnId }).catch((error) => {
+          log.warn('acp: background cancel failed', { sessionId: this.sessionId, error });
+        });
+      }
+      return;
+    }
     const turnId = driver.turnId;
     if (turnId === undefined) {
       // The launch round-trip has not returned the turn id yet. The engine's

@@ -27,6 +27,24 @@ type AgentEventRegistration = EventRegistration | StreamEventRegistration;
 
 // ── payload schemas ─────────────────────────────────────────────────────────
 
+export const contextAppendMessageEventSchema = z.object({
+  type: z.literal('context.append_message'),
+  time: z.number(),
+  message: z.unknown(),
+});
+
+export const contextApplyCompactionEventSchema = z.looseObject({
+  type: z.literal('context.apply_compaction'),
+  time: z.number(),
+});
+
+export const turnStepStartedEventSchema = z.object({
+  type: z.literal('turn.step.started'),
+  turnId: z.number(),
+  step: z.number(),
+  stepId: z.string().optional(),
+});
+
 export const turnStartedEventSchema = z.object({
   type: z.literal('turn.started'),
   time: z.number().optional(),
@@ -205,10 +223,27 @@ export const agentStatusUpdatedEventSchema = z.looseObject({
   phase: z.string().optional(),
 });
 
+/** `turn.step.retrying` — an LLM request failed and is being retried. */
+export const turnStepRetryingEventSchema = z.looseObject({
+  time: z.number().optional(),
+  turnId: z.number(),
+  step: z.number(),
+  failedAttempt: z.number(),
+  nextAttempt: z.number(),
+  maxAttempts: z.number(),
+  delayMs: z.number(),
+  errorName: z.string(),
+  errorMessage: z.string(),
+  statusCode: z.number().optional(),
+});
+
 // ── registrations ───────────────────────────────────────────────────────────
 
 /** Public event name → payload type. Keys must stay in sync with `agentEvents`. */
 export interface AgentEventPayloads {
+  'context.append_message': z.infer<typeof contextAppendMessageEventSchema>;
+  'context.apply_compaction': z.infer<typeof contextApplyCompactionEventSchema>;
+  'turn.step.started': z.infer<typeof turnStepStartedEventSchema>;
   'turn.started': z.infer<typeof turnStartedEventSchema>;
   'turn.ended': z.infer<typeof turnEndedEventSchema>;
   'assistant.delta': z.infer<typeof assistantDeltaEventSchema>;
@@ -228,12 +263,16 @@ export interface AgentEventPayloads {
   error: z.infer<typeof errorEventSchema>;
   warning: z.infer<typeof warningEventSchema>;
   'agent.status.updated': z.infer<typeof agentStatusUpdatedEventSchema>;
+  'turn.step.retrying': z.infer<typeof turnStepRetryingEventSchema>;
 }
 
 export type AgentEventName = keyof AgentEventPayloads;
 
 /** Public event name → stream binding + payload schema. */
 export const agentEvents = {
+  'context.apply_compaction': { kind: 'stream', name: 'events', type: 'context.apply_compaction', schema: contextApplyCompactionEventSchema },
+  'context.append_message': { kind: 'stream', name: 'events', type: 'context.append_message', schema: contextAppendMessageEventSchema },
+  'turn.step.started': { kind: 'stream', name: 'events', type: 'turn.step.started', schema: turnStepStartedEventSchema },
   'turn.started': { kind: 'stream', name: 'events', type: 'turn.started', schema: turnStartedEventSchema },
   'turn.ended': { kind: 'stream', name: 'events', type: 'turn.ended', schema: turnEndedEventSchema },
   'assistant.delta': { kind: 'stream', name: 'events', type: 'assistant.delta', schema: assistantDeltaEventSchema },
@@ -287,5 +326,11 @@ export const agentEvents = {
     name: 'events',
     type: 'agent.status.updated',
     schema: agentStatusUpdatedEventSchema,
+  },
+  'turn.step.retrying': {
+    kind: 'stream',
+    name: 'events',
+    type: 'turn.step.retrying',
+    schema: turnStepRetryingEventSchema,
   },
 } satisfies Record<AgentEventName, AgentEventRegistration>;

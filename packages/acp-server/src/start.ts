@@ -42,6 +42,7 @@ import type { Klient } from '@moonshot-ai/klient';
 import { createKlient } from '@moonshot-ai/klient/memory';
 
 import { acpClientFromContext } from './acp-client';
+import { readAcpHistory } from './replay-history';
 // Importing the `acp-fs` barrel also registers the ACP-backed Session-scope
 // `IHostFileSystem` and the App-scope `IAcpConnection` holder via the barrel's
 // module side effects. `IAcpConnection` is used below to bind the ACP client
@@ -152,6 +153,7 @@ export async function runAcpServerWithStream(
     terminalAuthEnv: opts.terminalAuthEnv,
     terminalAuthLegacyCommand: opts.terminalAuthLegacyCommand,
     slashCommands: opts.slashCommands,
+    readHistory: opts.readHistory ?? ((sessionId) => readAcpHistory(core, sessionId)),
     bindSessionRuntime: async (sessionId) => {
       const handle = getLiveSessionById(core.accessor, sessionId);
       if (handle === undefined) throw new Error(`session ${sessionId} is not live`);

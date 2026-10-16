@@ -286,12 +286,17 @@ export function displayBlockToAcpContent(block: ToolInputDisplay): ToolCallConte
       newText: block.after,
     };
   }
-  if (block.kind === 'file_io' && block.before !== undefined && block.after !== undefined) {
+  // Write carries the new file content as `content` (no before/after); Read
+  // carries neither. Map content-carrying file_io to an inline diff so
+  // clients render the written content instead of the raw args JSON.
+  if (block.kind === 'file_io') {
+    const newText = block.after ?? block.content;
+    if (newText === undefined) return null;
     return {
       type: 'diff',
       path: block.path,
-      oldText: block.before,
-      newText: block.after,
+      oldText: block.before ?? null,
+      newText,
     };
   }
   if (block.kind === 'plan_review') {

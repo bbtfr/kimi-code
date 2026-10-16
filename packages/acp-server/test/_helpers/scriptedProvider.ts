@@ -30,13 +30,22 @@ import {
   type Tool,
 } from '@moonshot-ai/agent-core-v2';
 import type { FinishReason } from '@moonshot-ai/agent-core-v2/human/llm/finish-reason';
+import type { LlmRemoteErrorMessage } from '@moonshot-ai/agent-core-v2/human/llm/errors';
 import { fromLlmMessage } from '@moonshot-ai/agent-core-v2/llm-adapter/contract/message';
 import type { LlmRequester } from '@moonshot-ai/agent-core-v2/human/llm/requester/requester';
+
+/** A queued provider failure — currently the retryable `status` kind (429 & co). */
+interface ScriptedLlmFailure {
+  readonly message: string;
+  readonly statusCode: number;
+  readonly retryAfterMs?: number;
+}
 
 interface ScriptedResponse {
   readonly parts: readonly StreamedMessagePart[];
   readonly finishReason?: FinishReason | null;
   readonly rawFinishReason?: string | null;
+  readonly error?: LlmRemoteErrorMessage;
 }
 
 const ZERO_USAGE: TokenUsage = {
@@ -63,6 +72,10 @@ class ScriptedStream {
     private readonly response: ScriptedResponse,
     private readonly index: number,
   ) {}
+
+  get error(): LlmRemoteErrorMessage | undefined {
+    return this.response.error;
+  }
 
   async *[Symbol.asyncIterator](): AsyncIterator<StreamedMessagePart> {
     for (const part of this.parts) {
@@ -127,7 +140,10 @@ export interface ScriptedProvider {
     readonly parts?: readonly StreamedMessagePart[];
     readonly finishReason?: FinishReason | null;
     readonly rawFinishReason?: string | null;
+    readonly error?: LlmRemoteErrorMessage;
   }): void;
+  /** Push a provider failure (retryable `status` kind, e.g. a 429). */
+  mockNextError(error: ScriptedLlmFailure): void;
   /** Number of `generate()` calls the engine has made so far. */
   callCount(): number;
   /** The `history` argument of every `generate()` call so far, in order. */
@@ -153,6 +169,10 @@ export function createScriptedProvider(): ScriptedProvider {
         for await (const part of stream) {
           control.onEvent?.({ type: 'llm.streaming.part', part });
           control.signal.throwIfAborted();
+        }
+        if (stream.error !== undefined) {
+          control.onEvent?.({ type: 'llm.failed.remote', error: stream.error });
+          return;
         }
         control.onEvent?.({ type: 'llm.streaming.usage', usage: stream.usage ?? ZERO_USAGE });
         control.onEvent?.({
@@ -207,7 +227,14 @@ export function createScriptedProvider(): ScriptedProvider {
         parts: structuredClone(response.parts ?? []),
         finishReason: response.finishReason,
         rawFinishReason: response.rawFinishReason,
+        error: response.error !== undefined ? { ...response.error } : undefined,
       });
+    },
+    mockNextError: (error) => {
+      queue.push({ parts: [], error: {
+        kind: 'status', message: error.message, statusCode: error.statusCode,
+        requestId: null, retryAfterMs: error.retryAfterMs ?? null, headers: null,
+      } });
     },
     callCount: () => calls.length,
     callHistory: () => calls,

@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
+import { contextMessageToSessionUpdates, formatContextNotification } from '../src/events-map';
 import { projectHistoryToSessionUpdates } from '../src/replay';
 
 import type { SessionNotification } from '@agentclientprotocol/sdk';
@@ -125,5 +126,54 @@ describe('projectHistoryToSessionUpdates', () => {
       .filter((u) => u.update.sessionUpdate === 'tool_call')
       .map((u) => (u.update as { toolCallId: string }).toolCallId);
     expect(ids).toEqual(['1:a', '2:b']);
+  });
+});
+
+
+describe('context notification envelopes', () => {
+  it('keeps notifications with unknown persisted origins readable', () => {
+    const message: ContextMessage = JSON.parse(JSON.stringify({ role: 'user', content: [{ type: 'text', text: 'future notification' }], toolCalls: [], origin: { kind: 'future_event' } }));
+    expect(formatContextNotification('future notification', message.origin)).toBe('future notification');
+    expect(projectHistoryToSessionUpdates(SESSION_ID, [message])[0]?.update).toMatchObject({ content: { text: 'future notification' } });
+  });
+  it('preserves existing envelopes and tagged skill instructions byte for byte', () => {
+    for (const text of ['<notification type="task.completed">Title: Done\na < b & c</notification>', '<cron-fire jobId="1"><prompt>a & b</prompt></cron-fire>', '<system-reminder>Today</system-reminder>', 'Skill loaded.\n<skill-loaded name="example">Instructions</skill-loaded>']) {
+      expect(formatContextNotification(text, { kind: 'injection', variant: 'example' })).toBe(text);
+    }
+  });
+  it('does not wrap user or shell content', () => {
+    for (const text of ['hello & goodbye', '<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>']) {
+      expect(formatContextNotification(text, { kind: 'user' })).toBe(text);
+      expect(formatContextNotification(text, { kind: 'shell_command', phase: 'output' })).toBe(text);
+      expect(formatContextNotification(text, undefined)).toBe(text);
+    }
+  });
+  it('escapes bare notifications without mutating their persisted messages', () => {
+    const message: ContextMessage = { role: 'user', content: [{ type: 'text', text: 'a < b & </notification>' }], toolCalls: [], origin: { kind: 'system_trigger', name: 'goal_continuation' } };
+    const before = JSON.stringify(message);
+    const expected = '<notification category="goal" type="goal.continuation">\nTitle: Continue active goal\n\na &lt; b &amp; &lt;/notification&gt;\n</notification>';
+    expect(formatContextNotification(message.content[0]!.type === 'text' ? message.content[0]!.text : '', message.origin)).toBe(expected);
+    expect(projectHistoryToSessionUpdates(SESSION_ID, [message])[0]?.update).toMatchObject({ content: { type: 'text', text: expected } });
+    expect(JSON.stringify(message)).toBe(before);
+  });
+  it('wraps unmarked summaries, plugin commands, hooks, missed cron and retries', () => {
+    const origins: NonNullable<ContextMessage['origin']>[] = [
+      { kind: 'compaction_summary' }, { kind: 'cron_missed', count: 1 },
+      { kind: 'plugin_command', activationId: 'a', pluginId: 'example', commandName: 'check', trigger: 'user-slash' },
+      { kind: 'hook_result', event: 'Stop' }, { kind: 'retry' },
+    ];
+    for (const origin of origins) expect(formatContextNotification('original body', origin)).toMatch(/^<notification .*original body\n<\/notification>$/s);
+  });
+});
+
+
+describe('opaque client envelopes', () => {
+  it('preserves client text and user channel in live context conversion and history', () => {
+    const text = '<client-context>\nClient-specific input & <details>\n</client-context>';
+    const message: ContextMessage = { id: 'client-message', role: 'user', origin: { kind: 'user' }, content: [{ type: 'text', text }], toolCalls: [] };
+    const live = contextMessageToSessionUpdates(SESSION_ID, message, 'fallback');
+    expect(projectHistoryToSessionUpdates(SESSION_ID, [message])).toEqual(live);
+    expect(live[0]?.update).toMatchObject({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text } });
+    expect(formatContextNotification(text, { kind: 'injection', variant: 'test' })).toBe(text);
   });
 });

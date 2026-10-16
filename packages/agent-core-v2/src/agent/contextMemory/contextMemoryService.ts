@@ -23,6 +23,7 @@ import {
 import { contextMemoryKey } from './contextOps';
 import type { LoopRecordedEvent } from './loopEventFold';
 import type { ContextMessage } from './types';
+import { newMessageId } from './messageId';
 
 export class AgentContextMemoryService extends Disposable implements IAgentContextMemoryService {
   declare readonly _serviceBrand: undefined;
@@ -58,12 +59,13 @@ export class AgentContextMemoryService extends Disposable implements IAgentConte
   append(...messages: readonly ContextMessage[]): void {
     if (messages.length === 0) return;
     const start = this.get().length;
-    for (const message of messages) {
+    const identified = messages.map((message) => ({ ...message, id: message.id ?? newMessageId() }));
+    for (const message of identified) {
       void this.dispatcher.dispatch(
         new ContextAppendMessage({ agentId: this.scopeContext.agentId, message }),
       );
     }
-    this.publishSplice({ start, deleteCount: 0, messages: [...messages] });
+    this.publishSplice({ start, deleteCount: 0, messages: identified });
   }
 
   appendLoopEvent(event: LoopRecordedEvent): void {
