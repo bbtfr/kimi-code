@@ -10,6 +10,7 @@ import {
   acpBlocksToContentParts,
   acpMcpServersToConfigRecord,
   compressPromptImageParts,
+  displayBlockToAcpContent,
 } from '../src/convert';
 import { solidPng, solidPngBase64 } from './_helpers/png';
 
@@ -159,5 +160,37 @@ describe('compressPromptImageParts', () => {
     expect(files).toHaveLength(1);
     expect(caption.text).toContain(files[0]!);
     expect(await readFile(join(originalsDir, files[0]!))).toEqual(original);
+  });
+});
+
+describe('displayBlockToAcpContent', () => {
+  it('maps a Write file_io display (content only) to an inline diff with null oldText', () => {
+    expect(
+      displayBlockToAcpContent({
+        kind: 'file_io',
+        operation: 'write',
+        path: '/tmp/notes.md',
+        content: '# hello\n',
+      }),
+    ).toEqual({ type: 'diff', path: '/tmp/notes.md', oldText: null, newText: '# hello\n' });
+  });
+
+  it('prefers after over content when both are present', () => {
+    expect(
+      displayBlockToAcpContent({
+        kind: 'file_io',
+        operation: 'edit',
+        path: '/tmp/a.ts',
+        before: 'old',
+        after: 'new',
+        content: 'ignored',
+      }),
+    ).toEqual({ type: 'diff', path: '/tmp/a.ts', oldText: 'old', newText: 'new' });
+  });
+
+  it('returns null for a Read file_io display (no content to diff)', () => {
+    expect(
+      displayBlockToAcpContent({ kind: 'file_io', operation: 'read', path: '/tmp/a.ts' }),
+    ).toBeNull();
   });
 });

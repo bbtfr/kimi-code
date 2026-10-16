@@ -187,6 +187,30 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     expect(scripted!.callCount()).toBe(2);
   }, 30_000);
 
+  it('maps Write to an inline diff (null oldText) instead of raw args JSON', async () => {
+    const c = await boot();
+    const path = join(homeDir!, 'written.md');
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    scripted!.mockNextResponse({
+      type: 'function', id: 'write_call', name: 'Write',
+      arguments: JSON.stringify({ path, content: '# notes\n' }),
+    });
+    scripted!.mockNextText('written');
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    await c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'write the file' }],
+    });
+    const updates = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    const completed = updates.find(u => u.sessionUpdate === 'tool_call_update' && u.status === 'completed');
+    expect(completed).toMatchObject({
+      toolCallId: '0:write_call',
+      locations: [{ path }],
+      content: expect.arrayContaining([{ type: 'diff', path, oldText: null, newText: '# notes\n' }]),
+    });
+  }, 30_000);
+
   it('keeps reused tool IDs correlated with their original turn on cold load', async () => {
     const c = await boot();
     const path = join(homeDir!, 'repeated-edit.txt');
