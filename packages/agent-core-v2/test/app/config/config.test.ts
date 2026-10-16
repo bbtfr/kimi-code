@@ -323,6 +323,7 @@ describe('Agent config', () => {
       [emit] prompt.submitted                { "time": "<time>", "agentId": "main", "promptId": "<msg-1>", "userMessageId": "<msg-1>", "status": "running", "content": [ { "type": "text", "text": "Look up before config changes" } ], "createdAt": "<time>" }
       [wire] turn.prompt                     { "agentId": "main", "input": [ { "type": "text", "text": "Look up before config changes" } ], "origin": { "kind": "user" }, "promptId": "<msg-1>", "turnId": 0, "time": "<time>" }
       [emit] turn.started                    { "time": "<time>", "agentId": "main", "turnId": 0, "promptId": "<msg-1>", "origin": { "kind": "user" }, "prompt": "Look up before config changes" }
+      [emit] context.append_message          { "time": "<time>", "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Look up before config changes" } ], "id": "<msg-1>", "toolCalls": [], "origin": { "kind": "user" } } }
       [emit] context.spliced                 { "time": "<time>", "agentId": "main", "start": 0, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Look up before config changes" } ], "id": "<msg-1>", "toolCalls": [], "origin": { "kind": "user" } } ] }
       [emit] prompt.started                  { "time": "<time>", "agentId": "main", "promptId": "<msg-1>" }
       [wire] context.append_message          { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Look up before config changes" } ], "id": "<msg-1>", "toolCalls": [], "origin": { "kind": "user" } }, "time": "<time>" }
@@ -374,8 +375,9 @@ describe('Agent config', () => {
       [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "tool.result", "parentUuid": "<uuid-3>", "toolCallId": "call_lookup", "result": { "output": "original-result" } }, "time": "<time>" }
       [emit] turn.step.completed         { "time": "<time>", "agentId": "main", "turnId": 0, "step": 1, "stepId": "<uuid-1>", "usage": { "inputOther": 9, "output": 17, "inputCacheRead": 0, "inputCacheCreation": 0 }, "finishReason": "tool_use", "providerFinishReason": "tool_calls", "rawFinishReason": "tool_calls" }
       [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.end", "uuid": "<uuid-1>", "turnId": "0", "step": 1, "finishReason": "tool_use", "usage": { "inputOther": 9, "output": 17, "inputCacheRead": 0, "inputCacheCreation": 0 }, "messageId": "mock-1", "providerFinishReason": "tool_calls", "rawFinishReason": "tool_calls" }, "time": "<time>" }
-      [emit] context.spliced             { "time": "<time>", "agentId": "main", "start": 3, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "<date-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "date_change", "disclosure": { "kind": "date", "renderGeneration": 2, "localDate": "<date>", "timeZone": "<time-zone>" } } } ] }
-      [wire] context.append_message      { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "<date-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "date_change", "disclosure": { "kind": "date", "renderGeneration": 2, "localDate": "<date>", "timeZone": "<time-zone>" } } }, "time": "<time>" }
+      [emit] context.append_message      { "time": "<time>", "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "<date-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "date_change", "disclosure": { "kind": "date", "renderGeneration": 2, "localDate": "<date>", "timeZone": "<time-zone>" } }, "id": "<msg-2>" } }
+      [emit] context.spliced             { "time": "<time>", "agentId": "main", "start": 3, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "<date-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "date_change", "disclosure": { "kind": "date", "renderGeneration": 2, "localDate": "<date>", "timeZone": "<time-zone>" } }, "id": "<msg-2>" } ] }
+      [wire] context.append_message      { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "<date-reminder>" } ], "toolCalls": [], "origin": { "kind": "injection", "variant": "date_change", "disclosure": { "kind": "date", "renderGeneration": 2, "localDate": "<date>", "timeZone": "<time-zone>" } }, "id": "<msg-2>" }, "time": "<time>" }
       [emit] turn.step.started           { "time": "<time>", "agentId": "main", "turnId": 0, "step": 2, "stepId": "<uuid-4>" }
       [wire] context.append_loop_event   { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-4>", "turnId": "0", "step": 2 }, "time": "<time>" }
       [emit] assistant.delta             { "time": "<time>", "agentId": "main", "turnId": 0, "delta": "Still using the original turn config." }
@@ -412,14 +414,15 @@ describe('Agent config', () => {
       [emit] agent.status.updated           { "time": "<time>", "agentId": "main", "contextTokens": 102 }
       [wire] prompt.completed               { "agentId": "main", "promptId": "<msg-1>", "finishedAt": "<time>", "reason": "completed", "time": "<time>" }
       [emit] prompt.completed               { "time": "<time>", "agentId": "main", "promptId": "<msg-1>", "finishedAt": "<time>", "reason": "completed" }
-      [emit] prompt.submitted               { "time": "<time>", "agentId": "main", "promptId": "<msg-2>", "userMessageId": "<msg-2>", "status": "running", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "createdAt": "<time>" }
-      [wire] turn.prompt                    { "agentId": "main", "input": [ { "type": "text", "text": "Start a fresh turn" } ], "origin": { "kind": "user" }, "promptId": "<msg-2>", "turnId": 1, "time": "<time>" }
-      [emit] turn.started                   { "time": "<time>", "agentId": "main", "turnId": 1, "promptId": "<msg-2>", "origin": { "kind": "user" }, "prompt": "Start a fresh turn" }
-      [emit] context.spliced                { "time": "<time>", "agentId": "main", "start": 5, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "id": "<msg-2>", "toolCalls": [], "origin": { "kind": "user" } } ] }
-      [emit] prompt.started                 { "time": "<time>", "agentId": "main", "promptId": "<msg-2>" }
-      [wire] context.append_message         { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "id": "<msg-2>", "toolCalls": [], "origin": { "kind": "user" } }, "time": "<time>" }
-      [wire] agent.message.appended         { "message": { "message": { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ] }, "meta": { "source": "input", "promptId": "<msg-2>", "origin": { "kind": "user" }, "tracked": true, "createdAt": "<time>", "userMessageId": "<msg-2>" } }, "time": "<time>", "kind": "event" }
-      [wire] agent.turn.started             { "turnId": 1, "queueItemId": "<msg-2>", "time": "<time>", "kind": "event" }
+      [emit] prompt.submitted               { "time": "<time>", "agentId": "main", "promptId": "<msg-3>", "userMessageId": "<msg-3>", "status": "running", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "createdAt": "<time>" }
+      [wire] turn.prompt                    { "agentId": "main", "input": [ { "type": "text", "text": "Start a fresh turn" } ], "origin": { "kind": "user" }, "promptId": "<msg-3>", "turnId": 1, "time": "<time>" }
+      [emit] turn.started                   { "time": "<time>", "agentId": "main", "turnId": 1, "promptId": "<msg-3>", "origin": { "kind": "user" }, "prompt": "Start a fresh turn" }
+      [emit] context.append_message         { "time": "<time>", "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "id": "<msg-3>", "toolCalls": [], "origin": { "kind": "user" } } }
+      [emit] context.spliced                { "time": "<time>", "agentId": "main", "start": 5, "deleteCount": 0, "messages": [ { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "id": "<msg-3>", "toolCalls": [], "origin": { "kind": "user" } } ] }
+      [emit] prompt.started                 { "time": "<time>", "agentId": "main", "promptId": "<msg-3>" }
+      [wire] context.append_message         { "agentId": "main", "message": { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ], "id": "<msg-3>", "toolCalls": [], "origin": { "kind": "user" } }, "time": "<time>" }
+      [wire] agent.message.appended         { "message": { "message": { "role": "user", "content": [ { "type": "text", "text": "Start a fresh turn" } ] }, "meta": { "source": "input", "promptId": "<msg-3>", "origin": { "kind": "user" }, "tracked": true, "createdAt": "<time>", "userMessageId": "<msg-3>" } }, "time": "<time>", "kind": "event" }
+      [wire] agent.turn.started             { "turnId": 1, "queueItemId": "<msg-3>", "time": "<time>", "kind": "event" }
       [emit] turn.step.started              { "time": "<time>", "agentId": "main", "turnId": 1, "step": 1, "stepId": "<uuid-6>" }
       [wire] context.append_loop_event      { "agentId": "main", "event": { "type": "step.begin", "uuid": "<uuid-6>", "turnId": "1", "step": 1 }, "time": "<time>" }
       [emit] assistant.delta                { "time": "<time>", "agentId": "main", "turnId": 1, "delta": "Now the changed config is active." }
@@ -2844,6 +2847,76 @@ describe('ConfigService replaceSections', () => {
     expect(config.inspect(DEFAULT_MODEL_SECTION).userValue).toBeUndefined();
     expect(config.inspect(THINKING_SECTION).userValue).toEqual({});
 
+    disposables.dispose();
+  });
+
+  it('round-trips model upgrade metadata using snake_case TOML fields', async () => {
+    const { config, disposables, storage } = await createSectionsConfig();
+    await config.replaceSections({
+      [MODELS_SECTION]: {
+        'acme/m1': {
+          provider: 'acme',
+          model: 'm1',
+          maxContextSize: 1000,
+          upgrade: {
+            model: 'm2',
+            migrationMarkdown: 'Use {model_to}',
+            retirementAt: '2030-01-01T00:00:00Z',
+          },
+        },
+      },
+    });
+
+    const onDisk = new TextDecoder().decode(await storage.read('', 'config.toml'));
+    expect(onDisk).toContain('migration_markdown = "Use {model_to}"');
+    expect(onDisk).toContain('retirement_at = "2030-01-01T00:00:00Z"');
+    expect(onDisk).not.toContain('migrationMarkdown');
+    expect(onDisk).not.toContain('retirementAt');
+
+    await config.reload();
+    const models = config.get<Record<string, { upgrade?: unknown }>>(MODELS_SECTION);
+    expect(models['acme/m1']?.upgrade).toEqual({
+      model: 'm2',
+      migrationMarkdown: 'Use {model_to}',
+      retirementAt: '2030-01-01T00:00:00Z',
+    });
+    disposables.dispose();
+  });
+
+  it('removes withdrawn upgrade metadata instead of merging it', async () => {
+    const { config, disposables, storage } = await createSectionsConfig();
+    const model = {
+      provider: 'acme',
+      model: 'm1',
+      maxContextSize: 1000,
+    };
+    await config.replaceSections({
+      [MODELS_SECTION]: {
+        'acme/m1': {
+          ...model,
+          upgrade: {
+            model: 'm2',
+            migrationMarkdown: 'Use {model_to}',
+            retirementAt: '2030-01-01T00:00:00Z',
+          },
+        },
+      },
+    });
+    await config.replaceSections({
+      [MODELS_SECTION]: {
+        'acme/m1': {
+          ...model,
+          upgrade: { model: 'm2', migrationMarkdown: 'Use {model_to}' },
+        },
+      },
+    });
+
+    const withoutRetirement = new TextDecoder().decode(await storage.read('', 'config.toml'));
+    expect(withoutRetirement).not.toContain('retirement_at');
+
+    await config.replaceSections({ [MODELS_SECTION]: { 'acme/m1': model } });
+    const withoutUpgrade = new TextDecoder().decode(await storage.read('', 'config.toml'));
+    expect(withoutUpgrade).not.toContain('[models."acme/m1".upgrade]');
     disposables.dispose();
   });
 

@@ -82,6 +82,14 @@ With `@agentclientprotocol/sdk@1.x`, the ACP method set is organized by namespac
 
 All methods not listed above return `methodNotFound`.
 
+## Updates and session history
+
+ACP clients receive scheduled turns, goal continuations, background task results, and context notifications even when no `session/prompt` request is pending. `session/cancel` also interrupts a background turn. A new prompt is rejected while a background turn is active.
+
+Live updates and `session/load` use shared converters for context messages and tool results. History is read from the session journal, including messages before compaction or context clearing; it is not limited to the model's current context. Compaction summaries are also sent live. Tool diffs and descriptions remain available after completion and on reload when the journal contains them. Older records that did not save a diff cannot recover it. Client-owned terminals are represented as text during replay because their original terminal handles are no longer available.
+
+Bare non-user context notifications use a `<notification category="..." type="...">` envelope containing a `Title:` line and the escaped message body. Existing tagged messages, ordinary user messages, and manual shell output keep their format. Unknown origin kinds are passed through unchanged. These envelopes affect ACP output only; they do not rewrite the context messages stored for the model or the web UI.
+
 ## MCP forwarding
 
 When an ACP client provides `mcpServers` in `session/new` or `session/load`, the ACP server performs the following conversions:

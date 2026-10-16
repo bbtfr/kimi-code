@@ -30,7 +30,7 @@ import type {
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
-import type { ContextMessage } from '@moonshot-ai/agent-core-v2';
+import { assistantStepMessageId, createContextTranscriptReducer, type ContextMessage } from '@moonshot-ai/agent-core-v2';
 import type {
   AgentEventPayloads,
   AgentHandle,
@@ -75,7 +75,9 @@ import {
   toolCallStartedUpgradeToSessionUpdate,
   toolCallStartToSessionUpdate,
   toolProgressToSessionUpdate,
-  toolResultToSessionUpdate,
+  completedToolToSessionUpdate,
+  contextMessageToSessionUpdates,
+  legacyMessageId,
   turnEndReasonToStopReason,
   usageUpdateNotification,
   isAuthError,
@@ -85,7 +87,7 @@ import { AcpInteractionBridge } from './interaction-bridge';
 import { log } from './log';
 import { projectModelCatalog } from './model-catalog';
 import { ACP_MODES, type AcpModeId, acpModeToToggles, DEFAULT_MODE_ID } from './modes';
-import { projectHistoryToSessionUpdates } from './replay';
+import { projectHistoryToSessionUpdates, type AcpHistory } from './replay';
 import { buildAcpSkillSlashCommands, detectSlashIntent } from './slash';
 
 /** Leading text of the first text block, if any (used for slash detection). */
@@ -167,9 +169,8 @@ interface TurnDriver {
   cancelRequested?: boolean;
   /**
    * Turn-scoped events that arrived while `turnId` was still unknown. Once
-   * the launch resolves, the entries matching the driver's turn are replayed
-   * in arrival order; the rest (a still-draining prior turn) are dropped —
-   * the same verdict the live path would have given.
+   * the launch resolves, all entries are forwarded in arrival order; only
+   * the matching turn may settle the prompt.
    */
   early: Array<{ readonly turnId: number; readonly dispatch: () => void }>;
 }
@@ -194,6 +195,9 @@ export class AcpSession {
   private skills: readonly SkillSummary[] = [];
   /** The in-flight prompt's driver, if any. */
   private driver: TurnDriver | undefined;
+  private activeTurnId: number | undefined;
+  private readonly toolCalls = new Map<string, ToolCallStartedEvent>();
+  private stepId: string | undefined;
   /**
    * Abort markers of prompts still in their pre-turn image-compression phase
    * (no turn launched yet, so `agent.cancel` has nothing to cancel).
@@ -259,6 +263,7 @@ export class AcpSession {
     private readonly hostCommands:
       | ReadonlyArray<AvailableCommand>
       | HostSlashCommandsSnapshot = [],
+    private readonly readHistory?: (sessionId: string) => Promise<AcpHistory>,
   ) {
     this.klient = klient;
     this.session = klient.session(sessionId);
@@ -275,6 +280,29 @@ export class AcpSession {
   async init(): Promise<void> {
     const events = this.agent.events;
     this.subscriptions.push(
+      events.on('context.append_message', (event) => {
+        const message = event.message as ContextMessage;
+        if (message.origin?.kind === 'user' && !message.origin.inTurn) return;
+        this.dispatchTurnEvent(this.activeTurnId ?? -1, () => {
+          for (const update of contextMessageToSessionUpdates(this.sessionId, message, legacyMessageId(message, event.time))) this.emit(update);
+        });
+      }),
+      events.on('context.apply_compaction', (event) => {
+        this.dispatchTurnEvent(this.activeTurnId ?? -1, () => {
+          const reducer = createContextTranscriptReducer();
+          reducer.add(event);
+          for (const message of reducer.result().entries) {
+            for (const update of contextMessageToSessionUpdates(this.sessionId, message, legacyMessageId(message, event.time))) this.emit(update);
+          }
+        });
+      }),
+      events.on('turn.step.started', (event) => {
+        this.dispatchTurnEvent(event.turnId, () => { this.stepId = event.stepId; });
+      }),
+      events.on('turn.started', (event) => {
+        this.activeTurnId = event.turnId;
+        this.stepId = undefined;
+      }),
       events.on('assistant.delta', (event) => {
         this.dispatchTurnEvent(event.turnId, () => {
           this.onAssistantDelta(event);
@@ -306,6 +334,7 @@ export class AcpSession {
         });
       }),
       events.on('turn.ended', (event) => {
+        if (this.activeTurnId === event.turnId) this.activeTurnId = undefined;
         this.dispatchTurnEvent(event.turnId, () => {
           this.onTurnEnded(event);
         });
@@ -438,10 +467,16 @@ export class AcpSession {
    */
   async replayHistory(): Promise<void> {
     let messages: readonly ContextMessage[];
+    let toolCalls: AcpHistory['toolCalls'];
+    let toolResults: AcpHistory['toolResults'];
     try {
       // `history` items cross the wire as JSON-cloned `ContextMessage`s (the
       // facade types them via the engine RPC signature).
-      messages = (await this.agent.getContext()).history;
+      if (this.readHistory !== undefined) {
+        ({ messages, toolCalls, toolResults } = await this.readHistory(this.sessionId));
+      } else {
+        messages = (await this.agent.getContext()).history;
+      }
     } catch (error) {
       log.warn('acp: replayHistory could not read context memory', {
         sessionId: this.sessionId,
@@ -449,7 +484,7 @@ export class AcpSession {
       });
       return;
     }
-    const updates = projectHistoryToSessionUpdates(this.sessionId, messages);
+    const updates = projectHistoryToSessionUpdates(this.sessionId, messages, toolCalls, toolResults);
     for (const update of updates) {
       try {
         await this.conn.sessionUpdate(update);
@@ -664,7 +699,7 @@ export class AcpSession {
    * two concurrent prompts cannot race past the check.
    */
   private assertNoActiveTurn(): void {
-    if (this.driver !== undefined && !this.driver.settled) {
+    if (this.activeTurnId !== undefined || (this.driver !== undefined && !this.driver.settled)) {
       throw RequestError.invalidRequest(
         { code: TURN_AGENT_BUSY_CODE },
         'another turn is already in progress',
@@ -720,11 +755,10 @@ export class AcpSession {
               });
             });
           }
-          // Replay the events the turn emitted before its id arrived (a fast
-          // turn can outrun the launch round-trip — `activateSkill` returns
-          // only after the prompt-metadata update).
+          // Attribution is ready; forward all buffered session events, including
+          // autonomous turns, without allowing them to settle this prompt.
           for (const early of driver.early.splice(0)) {
-            if (early.turnId === driver.turnId) early.dispatch();
+            early.dispatch();
           }
         },
         (error) => {
@@ -750,13 +784,13 @@ export class AcpSession {
   }
 
   /**
-   * Settle the driver exactly once and detach it from the session so later
-   * events of its turn are ignored.
+   * Settle the prompt exactly once; session events keep streaming independently.
    */
   private settleDriver(driver: TurnDriver, action: () => void): void {
     if (driver.settled) return;
     driver.settled = true;
     if (this.driver === driver) this.driver = undefined;
+    for (const early of driver.early.splice(0)) early.dispatch();
     action();
   }
 
@@ -770,20 +804,18 @@ export class AcpSession {
   }
 
   private onAssistantDelta(event: AgentEventPayloads['assistant.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
-    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event));
+    this.emit(assistantDeltaToSessionUpdate(this.sessionId, event, assistantStepMessageId(this.stepId)));
   }
 
   private onThinkingDelta(event: AgentEventPayloads['thinking.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
-    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event));
+    this.emit(thinkingDeltaToSessionUpdate(this.sessionId, event, assistantStepMessageId(this.stepId)));
   }
 
   private onToolCallStarted(event: AgentEventPayloads['tool.call.started']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolCallStartedEvent` (`args` / `display`
     // arrive as `unknown` — cast at this seam).
     const mapped = event as unknown as ToolCallStartedEvent;
+    this.toolCalls.set(acpToolCallId(event.turnId, event.toolCallId), mapped);
     const key = acpToolCallId(event.turnId, event.toolCallId);
     const locations = toolCallLocations(mapped.name, mapped.args, mapped.display);
     if (locations !== undefined) {
@@ -822,7 +854,6 @@ export class AcpSession {
   }
 
   private onToolCallDelta(event: AgentEventPayloads['tool.call.delta']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolCallDeltaEvent` field-for-field.
     const mapped = event as unknown as ToolCallDeltaEvent;
     const key = acpToolCallId(event.turnId, event.toolCallId);
@@ -844,7 +875,6 @@ export class AcpSession {
   }
 
   private onToolProgress(event: AgentEventPayloads['tool.progress']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     // The klient payload mirrors `ToolProgressEvent` field-for-field; the
     // helper forwards only `status` updates with text (as a title refresh)
     // and returns null for everything else, which `emit` drops.
@@ -852,9 +882,10 @@ export class AcpSession {
   }
 
   private onToolResult(event: AgentEventPayloads['tool.result']): void {
-    if (this.driverFor(event.turnId) === undefined) return;
     const key = acpToolCallId(event.turnId, event.toolCallId);
     const locations = this.toolLocations.get(key);
+    const call = this.toolCalls.get(key);
+    this.toolCalls.delete(key);
     this.toolLocations.delete(key);
     this.bashCallsAwaitingTerminal.delete(key);
     this.toolCallStreamArgs.delete(key);
@@ -878,7 +909,7 @@ export class AcpSession {
       return;
     }
     this.emit(
-      toolResultToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, locations),
+      completedToolToSessionUpdate(this.sessionId, event as unknown as ToolResultEvent, call),
     );
   }
 
@@ -964,8 +995,22 @@ export class AcpSession {
   }
 
   private onTurnEnded(event: AgentEventPayloads['turn.ended']): void {
+    const prefix = `${event.turnId}:`;
+    for (const key of this.toolCallStreamArgs.keys()) {
+      if (!key.startsWith(prefix)) continue;
+      this.toolCallStreamArgs.delete(key);
+      this.toolLocations.delete(key);
+      this.toolCalls.delete(key);
+      this.bashCallsAwaitingTerminal.delete(key);
+      this.terminalBackedCalls.delete(key);
+    }
     const driver = this.driverFor(event.turnId);
-    if (driver === undefined) return;
+    if (driver === undefined) {
+      const error = event.error as { message?: string } | undefined;
+      if (event.reason === 'failed') this.emitLocalChunk(error?.message ?? 'The background turn failed.');
+      void this.emitUsageUpdate();
+      return;
+    }
     const error = event.error as { readonly code: string; readonly message?: string } | undefined;
     // A failed turn otherwise settles as a plain `end_turn` with the error
     // logged out-of-band — clients would never show what went wrong.
@@ -1051,7 +1096,14 @@ export class AcpSession {
       pending.aborted = true;
     }
     const driver = this.driver;
-    if (driver === undefined || driver.settled) return;
+    if (driver === undefined || driver.settled) {
+      if (this.activeTurnId !== undefined) {
+        void this.agent.cancel({ turnId: this.activeTurnId }).catch((error) => {
+          log.warn('acp: background cancel failed', { sessionId: this.sessionId, error });
+        });
+      }
+      return;
+    }
     const turnId = driver.turnId;
     if (turnId === undefined) {
       // The launch round-trip has not returned the turn id yet. The engine's

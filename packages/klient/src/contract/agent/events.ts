@@ -27,6 +27,24 @@ type AgentEventRegistration = EventRegistration | StreamEventRegistration;
 
 // ── payload schemas ─────────────────────────────────────────────────────────
 
+export const contextAppendMessageEventSchema = z.object({
+  type: z.literal('context.append_message'),
+  time: z.number(),
+  message: z.unknown(),
+});
+
+export const contextApplyCompactionEventSchema = z.looseObject({
+  type: z.literal('context.apply_compaction'),
+  time: z.number(),
+});
+
+export const turnStepStartedEventSchema = z.object({
+  type: z.literal('turn.step.started'),
+  turnId: z.number(),
+  step: z.number(),
+  stepId: z.string().optional(),
+});
+
 export const turnStartedEventSchema = z.object({
   type: z.literal('turn.started'),
   time: z.number().optional(),
@@ -223,6 +241,9 @@ export const turnStepRetryingEventSchema = z.looseObject({
 
 /** Public event name → payload type. Keys must stay in sync with `agentEvents`. */
 export interface AgentEventPayloads {
+  'context.append_message': z.infer<typeof contextAppendMessageEventSchema>;
+  'context.apply_compaction': z.infer<typeof contextApplyCompactionEventSchema>;
+  'turn.step.started': z.infer<typeof turnStepStartedEventSchema>;
   'turn.started': z.infer<typeof turnStartedEventSchema>;
   'turn.ended': z.infer<typeof turnEndedEventSchema>;
   'assistant.delta': z.infer<typeof assistantDeltaEventSchema>;
@@ -249,6 +270,9 @@ export type AgentEventName = keyof AgentEventPayloads;
 
 /** Public event name → stream binding + payload schema. */
 export const agentEvents = {
+  'context.apply_compaction': { kind: 'stream', name: 'events', type: 'context.apply_compaction', schema: contextApplyCompactionEventSchema },
+  'context.append_message': { kind: 'stream', name: 'events', type: 'context.append_message', schema: contextAppendMessageEventSchema },
+  'turn.step.started': { kind: 'stream', name: 'events', type: 'turn.step.started', schema: turnStepStartedEventSchema },
   'turn.started': { kind: 'stream', name: 'events', type: 'turn.started', schema: turnStartedEventSchema },
   'turn.ended': { kind: 'stream', name: 'events', type: 'turn.ended', schema: turnEndedEventSchema },
   'assistant.delta': { kind: 'stream', name: 'events', type: 'assistant.delta', schema: assistantDeltaEventSchema },

@@ -73,6 +73,7 @@ import { acpMcpServersToConfigRecord } from './convert';
 import { log } from './log';
 import { isAcpModeId } from './modes';
 import { AcpSession } from './session';
+import type { AcpHistory } from './replay';
 import { negotiateVersion } from './version';
 
 /**
@@ -134,6 +135,7 @@ export interface AcpServerOptions {
    * not the klient facade) — `start.ts` builds it from the bootstrapped App
    * scope. Absent → `persistOriginalImage`'s shared temp-dir fallback.
    */
+  readonly readHistory?: (sessionId: string) => Promise<AcpHistory>;
   readonly resolveOriginalsDir?: (sessionId: string) => string | undefined;
   readonly bindSessionRuntime?: (sessionId: string) => Promise<void>;
   readonly unbindSessionRuntime?: (sessionId: string) => Promise<void>;
@@ -147,6 +149,7 @@ export class AcpServer {
   private readonly disableAuth: boolean;
   private readonly terminalAuthEnv: Readonly<Record<string, string>> | undefined;
   private readonly terminalAuthLegacyCommand: string | undefined;
+  private readonly readHistory: AcpServerOptions['readHistory'];
   private readonly resolveOriginalsDir: ((sessionId: string) => string | undefined) | undefined;
   private readonly bindSessionRuntime: ((sessionId: string) => Promise<void>) | undefined;
   private readonly unbindSessionRuntime: ((sessionId: string) => Promise<void>) | undefined;
@@ -170,6 +173,7 @@ export class AcpServer {
     this.disableAuth = opts.disableAuth ?? false;
     this.terminalAuthEnv = opts.terminalAuthEnv;
     this.terminalAuthLegacyCommand = opts.terminalAuthLegacyCommand;
+    this.readHistory = opts.readHistory;
     this.resolveOriginalsDir = opts.resolveOriginalsDir;
     this.bindSessionRuntime = opts.bindSessionRuntime;
     this.unbindSessionRuntime = opts.unbindSessionRuntime;
@@ -572,6 +576,7 @@ export class AcpServer {
       Boolean(this.clientCapabilities?.elicitation?.form),
       this.resolveOriginalsDir,
       hostCommands,
+      this.readHistory,
     );
     await acpSession.init();
     return acpSession;

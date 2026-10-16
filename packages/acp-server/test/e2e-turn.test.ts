@@ -9,14 +9,15 @@
  * `assistant.delta` → ACP `session/update` translation, and turn settlement.
  */
 
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { getLiveSessionById, IAgentLifecycleService, IEventBus } from '@moonshot-ai/agent-core-v2';
+import { getLiveSessionById, IAgentLifecycleService, IAgentCronService, IAgentLoopService, IAgentGoalService, IEventBus } from '@moonshot-ai/agent-core-v2';
+import type { SessionNotification } from '@agentclientprotocol/sdk';
 import { ToolProgress } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/toolExecutorEvents';
-import { afterEach, describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { mapPromptLaunchError } from '../src/session';
 import { createTestClient, type TestClient } from './_helpers/acpClient';
@@ -28,6 +29,29 @@ import { createScriptedProvider, type ScriptedProvider } from './_helpers/script
 const STDIO_MCP_FIXTURE = fileURLToPath(
   new URL('../../agent-core-v2/test/mcpCore/fixtures/mock-stdio-server.mjs', import.meta.url),
 );
+
+// Compare settled protocol state, not token chunk sizes or transient progress.
+function settledTranscript(updates: readonly SessionNotification['update'][]): unknown[] {
+  const entries = new Map<string, Record<string, unknown>>();
+  for (const update of updates) {
+    const kind = update.sessionUpdate;
+    if (kind === 'user_message_chunk' || kind === 'agent_message_chunk' || kind === 'agent_thought_chunk') {
+      if (kind === 'user_message_chunk' && (update._meta?.['origin'] as { kind?: string } | undefined)?.kind === 'user') continue;
+      if (update.content.type !== 'text') continue;
+      const key = `${kind}:${update.messageId}`;
+      const previous = entries.get(key);
+      const priorText = typeof previous?.['text'] === 'string' ? previous['text'] : '';
+      entries.set(key, { type: kind, id: update.messageId, text: `${priorText}${update.content.text}`, meta: update._meta });
+    } else if (kind === 'tool_call' || kind === 'tool_call_update') {
+      const key = `tool:${update.toolCallId}`;
+      const { sessionUpdate: _kind, ...fields } = update;
+      entries.set(key, { ...entries.get(key), ...Object.fromEntries(Object.entries(fields).filter(([, v]) => v !== undefined)) });
+    } else if (kind === 'plan') {
+      entries.set('plan', { entries: update.entries });
+    }
+  }
+  return JSON.parse(JSON.stringify([...entries.values()]));
+}
 
 describe('acp-server real prompt turn (scripted LLM)', () => {
   let homeDir: string | undefined;
@@ -43,6 +67,7 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
       await rm(homeDir, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
       homeDir = undefined;
     }
+    vi.unstubAllEnvs();
   });
 
   function installTerminalClient(c: TestClient): void {
@@ -57,9 +82,9 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     c.onRequest('terminal/release', () => ({}));
   }
 
-  async function boot(clientCapabilities: Record<string, unknown> = {}): Promise<TestClient> {
+  async function boot(clientCapabilities: Record<string, unknown> = {}, imageIn = false): Promise<TestClient> {
     homeDir = await mkdtemp(join(tmpdir(), 'acp-e2e-turn-'));
-    await writeFakeModelConfig(homeDir);
+    await writeFakeModelConfig(homeDir, { imageIn });
     scripted = createScriptedProvider();
     client = await createTestClient({ homeDir, extraSeeds: [scripted.seed] });
     await client.send('initialize', { protocolVersion: 1, clientCapabilities });
@@ -103,6 +128,303 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     expect(usageUpdate?.size).toBe(8192);
     expect(usageUpdate?.used).toBeGreaterThan(0);
     expect(usageUpdate?.cost).toBeUndefined();
+  }, 30_000);
+
+  it('preserves opaque client envelopes as user messages after cold load', async () => {
+    let c = await boot();
+    scripted!.mockNextText('received');
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const text = '<client-context>\nCheck <file> & report.\n</client-context>';
+    await c.send('session/prompt', { sessionId: created.sessionId, prompt: [{ type: 'text', text }] });
+    const live = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(live.filter(u => u.sessionUpdate === 'user_message_chunk' && u.content.type === 'text' && u.content.text === text)).toHaveLength(0);
+    await c.close();
+    client = undefined;
+    c = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    client = c;
+    await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await c.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    const replay = c.sessionUpdates().map(m => (m.params as SessionNotification).update)
+      .filter(u => u.sessionUpdate === 'user_message_chunk' && u.content.type === 'text' && u.content.text === text);
+    expect(replay).toHaveLength(1);
+  }, 30_000);
+
+  it('keeps Edit diffs through completion and a cold session/load', async () => {
+    let c = await boot();
+    const path = join(homeDir!, 'edit.txt');
+    await writeFile(path, 'before\n');
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    scripted!.mockNextResponse({
+      type: 'function', id: 'edit_call', name: 'Edit',
+      arguments: JSON.stringify({ path, old_string: 'before', new_string: 'after' }),
+    });
+    scripted!.mockNextText('edited');
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    await c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'edit the file' }],
+    });
+    const updates = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(updates.filter(u => u.sessionUpdate === 'user_message_chunk' && (u._meta?.['origin'] as { kind?: string } | undefined)?.kind === 'user')).toEqual([]);
+    const completed = updates.find(u => u.sessionUpdate === 'tool_call_update' && u.status === 'completed');
+    expect(completed).toMatchObject({
+      toolCallId: '0:edit_call', rawOutput: expect.stringContaining('Replaced'),
+      content: expect.arrayContaining([{ type: 'diff', path, oldText: 'before', newText: 'after' }]),
+    });
+    await c.close();
+    client = undefined;
+    c = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    client = c;
+    await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await c.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    const replayed = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(replayed.find(u => u.sessionUpdate === 'tool_call_update' && u.status === 'completed')).toMatchObject({
+      toolCallId: '0:edit_call',
+      content: expect.arrayContaining([{ type: 'diff', path, oldText: 'before', newText: 'after' }]),
+    });
+    expect(settledTranscript(replayed)).toEqual(settledTranscript(updates));
+    expect(scripted!.callCount()).toBe(2);
+  }, 30_000);
+
+  it('keeps reused tool IDs correlated with their original turn on cold load', async () => {
+    const c = await boot();
+    const path = join(homeDir!, 'repeated-edit.txt');
+    await writeFile(path, 'before\n');
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    for (const [oldText, newText] of [['before', 'middle'], ['middle', 'after']]) {
+      scripted!.mockNextResponse({
+        type: 'function', id: 'reused_edit', name: 'Edit',
+        arguments: JSON.stringify({ path, old_string: oldText, new_string: newText }),
+      });
+      scripted!.mockNextText(`changed to ${newText}`);
+      await c.send('session/prompt', {
+        sessionId: created.sessionId, prompt: [{ type: 'text', text: `change to ${newText}` }],
+      });
+    }
+    const live = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    const completed = live.flatMap(u => u.sessionUpdate === 'tool_call_update' && u.status === 'completed' ? [u] : []);
+    expect(completed.map(u => u.toolCallId)).toEqual(['0:reused_edit', '1:reused_edit__2']);
+    expect(completed[0]).toMatchObject({ content: expect.arrayContaining([{ type: 'diff', path, oldText: 'before', newText: 'middle' }]) });
+    expect(completed[1]).toMatchObject({ content: expect.arrayContaining([{ type: 'diff', path, oldText: 'middle', newText: 'after' }]) });
+    await c.close();
+    client = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await client.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    expect(settledTranscript(client.sessionUpdates().map(m => (m.params as SessionNotification).update))).toEqual(settledTranscript(live));
+    expect(scripted!.callCount()).toBe(4);
+  }, 30_000);
+
+  it('replays the final empty plan after updating and clearing TodoList', async () => {
+    const c = await boot();
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    scripted!.mockNextResponse({ type: 'function', id: 'plan_set', name: 'TodoList', arguments: JSON.stringify({ todos: [{ title: 'Verify ACP history', status: 'in_progress' }] }) });
+    scripted!.mockNextResponse({ type: 'function', id: 'plan_clear', name: 'TodoList', arguments: JSON.stringify({ todos: [] }) });
+    scripted!.mockNextText('plan cleared');
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    await c.send('session/prompt', { sessionId: created.sessionId, prompt: [{ type: 'text', text: 'update and clear the plan' }] });
+    const live = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(live.filter(u => u.sessionUpdate === 'plan')).toEqual([
+      { sessionUpdate: 'plan', entries: [{ content: 'Verify ACP history', priority: 'medium', status: 'in_progress' }] },
+      { sessionUpdate: 'plan', entries: [] },
+    ]);
+    await c.close();
+    client = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await client.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    expect(settledTranscript(client.sessionUpdates().map(m => (m.params as SessionNotification).update))).toEqual(settledTranscript(live));
+  }, 30_000);
+
+  it('delivers a real background Bash completion after the prompt settles and replays it', async () => {
+    const c = await boot();
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    scripted!.mockNextResponse({ type: 'function', id: 'background_bash', name: 'Bash', arguments: JSON.stringify({
+      command: 'while [ ! -f release-background ]; do sleep 0.02; done; printf "BACKGROUND_TOOL_DONE\\n"',
+      cwd: homeDir, run_in_background: true, description: 'Background completion probe', timeout: 10,
+    }) });
+    scripted!.mockNextText('background task started');
+    scripted!.mockNextText('background completion received');
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    await c.send('session/prompt', { sessionId: created.sessionId, prompt: [{ type: 'text', text: 'start a background task' }] });
+    expect(scripted!.callCount()).toBe(2);
+    const split = c.sessionUpdates().length;
+    await writeFile(join(homeDir!, 'release-background'), 'ready');
+    await expect.poll(() => c.sessionUpdates().slice(split).some(m => {
+      const update = (m.params as SessionNotification).update;
+      return update.sessionUpdate === 'agent_message_chunk' && update.content.type === 'text' && update.content.text === 'background completion received';
+    }), { timeout: 5000 }).toBe(true);
+    const session = getLiveSessionById(c.server.core.accessor, created.sessionId)!;
+    await session.accessor.get(IAgentLifecycleService).handleOf('main')!.accessor.get(IAgentLoopService).settled();
+    const live = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(live).toContainEqual(expect.objectContaining({
+      sessionUpdate: 'user_message_chunk',
+      content: { type: 'text', text: expect.stringContaining('Background completion probe completed.') },
+      _meta: { origin: expect.objectContaining({ kind: 'task', status: 'completed' }) },
+    }));
+    const notice = live.find(u => u.sessionUpdate === 'user_message_chunk' && (u._meta?.['origin'] as { kind?: string } | undefined)?.kind === 'task');
+    expect(notice?.sessionUpdate).toBe('user_message_chunk');
+    if (notice?.sessionUpdate !== 'user_message_chunk' || notice.content.type !== 'text') throw new Error('Missing task notification');
+    const outputPath = /<output-file path="([^"]+)"/.exec(notice.content.text)?.[1];
+    expect(outputPath).toBeDefined();
+    expect(await readFile(outputPath!, 'utf8')).toContain('BACKGROUND_TOOL_DONE');
+    await c.close();
+    client = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await client.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    expect(settledTranscript(client.sessionUpdates().map(m => (m.params as SessionNotification).update))).toEqual(settledTranscript(live));
+    expect(scripted!.callCount()).toBe(3);
+  }, 30_000);
+
+  it('hydrates image tool results identically after a cold load', async () => {
+    const c = await boot({}, true);
+    const path = join(homeDir!, 'image.png');
+    await writeFile(path, Buffer.from(solidPngBase64(16, 16), 'base64'));
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    scripted!.mockNextResponse({ type: 'function', id: 'read_image', name: 'ReadMediaFile', arguments: JSON.stringify({ path }) });
+    scripted!.mockNextText('image read');
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    await c.send('session/prompt', { sessionId: created.sessionId, prompt: [{ type: 'text', text: 'read the image' }] });
+    const live = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(live).toContainEqual(expect.objectContaining({
+      sessionUpdate: 'tool_call_update', status: 'completed',
+      rawOutput: expect.arrayContaining([expect.objectContaining({ type: 'image_url', imageUrl: expect.objectContaining({ url: expect.stringMatching(/^data:image\//) }) })]),
+    }));
+    await c.close();
+    client = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await client.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    expect(settledTranscript(client.sessionUpdates().map(m => (m.params as SessionNotification).update))).toEqual(settledTranscript(live));
+  }, 30_000);
+
+  it('streams a real cron turn without an ACP prompt, including its origin, tools and answer', async () => {
+    const c = await boot();
+    const clock = join(homeDir!, 'clock');
+    const now = Date.UTC(2026, 0, 1);
+    await writeFile(clock, String(now));
+    vi.stubEnv('KIMI_CRON_CLOCK', `file:${clock}`);
+    vi.stubEnv('KIMI_CRON_MANUAL_TICK', '1');
+    vi.stubEnv('KIMI_CRON_NO_JITTER', '1');
+    vi.stubEnv('KIMI_DISABLE_CRON', '0');
+    scripted!.mockNextResponse({ type: 'think', think: 'checking the scheduled task' }, {
+      type: 'function', id: 'cron_read', name: 'Read', arguments: JSON.stringify({ path: clock }),
+    });
+    scripted!.mockNextText('scheduled task finished');
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const session = getLiveSessionById(c.server.core.accessor, created.sessionId)!;
+    const agent = session.accessor.get(IAgentLifecycleService).handleOf('main')!;
+    const cron = agent.accessor.get(IAgentCronService);
+    cron.addTask({ cron: '* * * * *', prompt: 'check the clock', recurring: false });
+    await writeFile(clock, String(now + 60_000));
+    expect(cron.list()).toHaveLength(1);
+    expect(cron.now()).toBe(now + 60_000);
+    expect(cron.getNextFireTime()).toBe(now + 60_000);
+    await cron.tick();
+    await expect.poll(() => scripted!.callCount(), { timeout: 2000 }).toBe(2);
+    await c.waitForSessionUpdate('usage_update', 10_000);
+    const updates = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(updates).toContainEqual(expect.objectContaining({
+      sessionUpdate: 'user_message_chunk', content: expect.objectContaining({ text: expect.stringMatching(/^<cron-fire\s/) }),
+      _meta: expect.objectContaining({ origin: expect.objectContaining({ kind: 'cron_job' }) }),
+    }));
+    expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'agent_thought_chunk' }));
+    expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'tool_call_update', status: 'completed' }));
+    expect(updates).toContainEqual(expect.objectContaining({
+      sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'scheduled task finished' },
+    }));
+    expect(scripted!.callCount()).toBe(2);
+    await c.close();
+    client = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await client.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    expect(settledTranscript(client.sessionUpdates().map(m => (m.params as SessionNotification).update))).toEqual(settledTranscript(updates));
+    scripted!.mockNextText('ordinary follow-up');
+    expect(await client.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'continue' }],
+    })).toMatchObject({ stopReason: 'end_turn' });
+  }, 30_000);
+
+  it('preserves busy task notifications, errors and a goal continuation across cold load', async () => {
+    const c = await boot();
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const session = getLiveSessionById(c.server.core.accessor, created.sessionId)!;
+    const agent = session.accessor.get(IAgentLifecycleService).handleOf('main')!;
+    const loop = agent.accessor.get(IAgentLoopService);
+    const goals = agent.accessor.get(IAgentGoalService);
+    await goals.createGoal({ objective: 'verify notifications' });
+    await goals.setBudgetLimits({ budgetLimits: { turnBudget: 2 } });
+    let approve: (() => void) | undefined;
+    c.onRequest('session/request_permission', async () => {
+      await new Promise<void>(resolve => { approve = resolve; });
+      return { outcome: { outcome: 'selected', optionId: 'approve_once' } };
+    });
+    scripted!.mockNextResponse({ type: 'text', text: 'checking' }, {
+      type: 'function', id: 'busy_bash', name: 'Bash',
+      arguments: JSON.stringify({ command: 'echo busy_tool' }),
+    });
+    scripted!.mockNextResponse({ type: 'function', id: 'missing_read', name: 'Read', arguments: JSON.stringify({ path: join(homeDir!, 'missing') }) });
+    scripted!.mockNextText('task notification received');
+    scripted!.mockNextText('goal continued');
+    const prompt = c.send('session/prompt', { sessionId: created.sessionId, prompt: [{ type: 'text', text: 'start' }] });
+    await expect.poll(() => approve !== undefined).toBe(true);
+    const origin = { kind: 'task', taskId: 'task-example', status: 'completed', notificationId: 'notice-example' };
+    loop.submit({
+      message: { role: 'user', content: [{ type: 'text', text: 'BACKGROUND_COMPLETION_BODY' }] },
+      meta: { origin },
+    }, { steerIfActive: true });
+    approve!();
+    await prompt;
+    await expect.poll(() => scripted!.callCount(), { timeout: 5000 }).toBe(4);
+    await loop.settled();
+    await new Promise(resolve => setTimeout(resolve, 20));
+    const updates = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'user_message_chunk', content: { type: 'text', text: expect.stringMatching(/^<notification[^>]*>\nTitle: Background task completed\n\nBACKGROUND_COMPLETION_BODY\n<\/notification>$/) } }));
+    expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'user_message_chunk', _meta: expect.objectContaining({ origin: { kind: 'system_trigger', name: 'goal_continuation' } }) }));
+    expect(updates).toContainEqual(expect.objectContaining({ sessionUpdate: 'tool_call_update', status: 'failed' }));
+    await c.close();
+    client = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await client.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    expect(settledTranscript(client.sessionUpdates().map(m => (m.params as SessionNotification).update))).toEqual(settledTranscript(updates));
+  }, 30_000);
+
+  it('can cancel an autonomous task turn and rejects a competing ACP prompt', async () => {
+    const c = await boot();
+    scripted!.mockNextResponse({
+      type: 'function', id: 'task_bash', name: 'Bash', arguments: JSON.stringify({ command: 'sleep 30' }),
+    });
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const session = getLiveSessionById(c.server.core.accessor, created.sessionId)!;
+    const agent = session.accessor.get(IAgentLifecycleService).handleOf('main')!;
+    const loop = agent.accessor.get(IAgentLoopService);
+    const origin = { kind: 'task', taskId: 'task-example', status: 'completed', notificationId: 'notification-example' };
+    loop.submit({
+      message: { role: 'user', content: [{ type: 'text', text: 'continue after task completion' }] },
+      meta: { origin },
+    });
+    await c.waitForSessionUpdate('tool_call', 10_000);
+    await expect(c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'overlapping prompt' }],
+    })).rejects.toThrow('turn.agent_busy');
+    c.notify('session/cancel', { sessionId: created.sessionId });
+    await c.waitForSessionUpdate('usage_update', 10_000);
+    await loop.settled();
+    expect(loop.snapshot().state).not.toBe('running');
+    expect(scripted!.callCount()).toBe(1);
   }, 30_000);
 
   it('runs a tool call and bridges the approval request to the client', async () => {
@@ -799,6 +1121,17 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     expect(completion).toContain('Messages compacted:');
     expect(completion).toContain('Tokens before:');
     expect(completion).toContain('Tokens after:');
+    const summaries = (connection: TestClient) => connection.sessionUpdates()
+      .map(m => (m.params as SessionNotification).update)
+      .filter(u => u.sessionUpdate === 'user_message_chunk' && u.content.type === 'text' && u.content.text.includes('type="context.compaction"'));
+    const live = summaries(c);
+    expect(live).toHaveLength(1);
+    expect(live[0]).toMatchObject({ content: { text: expect.stringContaining('compaction summary') } });
+    await c.close();
+    client = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    await client.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await client.send('session/load', { sessionId, cwd: homeDir, mcpServers: [] });
+    expect(summaries(client)).toEqual(live);
   }, 30_000);
 
   it('a retryable provider failure (429) surfaces as a notification envelope, then recovers', async () => {
