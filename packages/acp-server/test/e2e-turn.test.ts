@@ -791,11 +791,49 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     expect(chunk).toContain('Context compaction started');
 
     // The compaction lifecycle events subscribed at session scope push the
-    // terminal report as a follow-up chunk once the background task settles.
+    // terminal report as a follow-up chunk once the background task settles —
+    // wrapped in a `<notification>` envelope, not bare assistant text.
     const completion = await waitForChunk(c, 'Compaction completed.');
+    expect(completion).toContain('<notification source="kimi" category="context"');
+    expect(completion).toContain('type="context.compaction"');
     expect(completion).toContain('Messages compacted:');
     expect(completion).toContain('Tokens before:');
     expect(completion).toContain('Tokens after:');
+  }, 30_000);
+
+  it('a retryable provider failure (429) surfaces as a notification envelope, then recovers', async () => {
+    const c = await boot();
+    const sessionId = await newSession(c);
+
+    scripted!.mockNextError({ message: 'rate limit exceeded', statusCode: 429 });
+    scripted!.mockNextText('recovered reply');
+    const prompt = c.send('session/prompt', {
+      sessionId,
+      prompt: [{ type: 'text', text: 'hi' }],
+    });
+
+    const notice = await waitForChunk(c, 'llm.retrying');
+    expect(notice).toContain('<notification source="kimi" category="system"');
+    expect(notice).toContain('rate limit exceeded (HTTP 429)');
+    const result = (await prompt) as { stopReason: string };
+    expect(result.stopReason).toBe('end_turn');
+    expect(await waitForChunk(c, 'recovered reply')).toBeTruthy();
+  }, 30_000);
+
+  it('a non-retryable provider failure ends the turn with a failure notification envelope', async () => {
+    const c = await boot();
+    const sessionId = await newSession(c);
+
+    scripted!.mockNextError({ message: 'bad request: model rejected the input', statusCode: 400 });
+    const result = (await c.send('session/prompt', {
+      sessionId,
+      prompt: [{ type: 'text', text: 'hi' }],
+    })) as { stopReason: string };
+    expect(result.stopReason).toBe('end_turn');
+
+    const notice = await waitForChunk(c, 'turn.failed');
+    expect(notice).toContain('<notification source="kimi" category="system"');
+    expect(notice).toContain('bad request: model rejected the input');
   }, 30_000);
 
   /**

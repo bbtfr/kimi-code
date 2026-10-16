@@ -205,6 +205,20 @@ export const agentStatusUpdatedEventSchema = z.looseObject({
   phase: z.string().optional(),
 });
 
+/** `turn.step.retrying` — an LLM request failed and is being retried. */
+export const turnStepRetryingEventSchema = z.looseObject({
+  time: z.number().optional(),
+  turnId: z.number(),
+  step: z.number(),
+  failedAttempt: z.number(),
+  nextAttempt: z.number(),
+  maxAttempts: z.number(),
+  delayMs: z.number(),
+  errorName: z.string(),
+  errorMessage: z.string(),
+  statusCode: z.number().optional(),
+});
+
 // ── registrations ───────────────────────────────────────────────────────────
 
 /** Public event name → payload type. Keys must stay in sync with `agentEvents`. */
@@ -228,6 +242,7 @@ export interface AgentEventPayloads {
   error: z.infer<typeof errorEventSchema>;
   warning: z.infer<typeof warningEventSchema>;
   'agent.status.updated': z.infer<typeof agentStatusUpdatedEventSchema>;
+  'turn.step.retrying': z.infer<typeof turnStepRetryingEventSchema>;
 }
 
 export type AgentEventName = keyof AgentEventPayloads;
@@ -287,5 +302,11 @@ export const agentEvents = {
     name: 'events',
     type: 'agent.status.updated',
     schema: agentStatusUpdatedEventSchema,
+  },
+  'turn.step.retrying': {
+    kind: 'stream',
+    name: 'events',
+    type: 'turn.step.retrying',
+    schema: turnStepRetryingEventSchema,
   },
 } satisfies Record<AgentEventName, AgentEventRegistration>;

@@ -30,13 +30,28 @@ import {
   type Tool,
 } from '@moonshot-ai/agent-core-v2';
 import type { FinishReason } from '@moonshot-ai/agent-core-v2/human/llm/finish-reason';
+import type { LlmErrorMessage } from '@moonshot-ai/agent-core-v2/human/llm/errors';
 import { fromLlmMessage } from '@moonshot-ai/agent-core-v2/llm-adapter/contract/message';
 import type { LlmRequester } from '@moonshot-ai/agent-core-v2/human/llm/requester/requester';
+
+/** A queued provider failure — currently the retryable `status` kind (429 & co). */
+interface ScriptedLlmFailure {
+  readonly message: string;
+  readonly statusCode: number;
+  readonly retryAfterMs?: number;
+}
+
+class ScriptedLlmError extends Error {
+  constructor(readonly llmError: LlmErrorMessage<'status'>) {
+    super(llmError.message);
+  }
+}
 
 interface ScriptedResponse {
   readonly parts: readonly StreamedMessagePart[];
   readonly finishReason?: FinishReason | null;
   readonly rawFinishReason?: string | null;
+  readonly error?: ScriptedLlmFailure;
 }
 
 const ZERO_USAGE: TokenUsage = {
@@ -102,6 +117,16 @@ class ScriptedChatProvider {
           `queue exhausted. Push another response via mockNextResponse().`,
       );
     }
+    if (response.error !== undefined) {
+      throw new ScriptedLlmError({
+        kind: 'status',
+        message: response.error.message,
+        statusCode: response.error.statusCode,
+        requestId: null,
+        retryAfterMs: response.error.retryAfterMs ?? null,
+        headers: null,
+      });
+    }
     this.calls.push(history);
     return new ScriptedStream(response.parts, response, this.calls.length);
   }
@@ -128,6 +153,8 @@ export interface ScriptedProvider {
     readonly finishReason?: FinishReason | null;
     readonly rawFinishReason?: string | null;
   }): void;
+  /** Push a provider failure (retryable `status` kind, e.g. a 429). */
+  mockNextError(error: ScriptedLlmFailure): void;
   /** Number of `generate()` calls the engine has made so far. */
   callCount(): number;
   /** The `history` argument of every `generate()` call so far, in order. */
@@ -169,10 +196,13 @@ export function createScriptedProvider(): ScriptedProvider {
       } catch (error) {
         control.onEvent?.({
           type: 'llm.failed.remote',
-          error: {
-            kind: 'unknown',
-            message: error instanceof Error ? error.message : String(error),
-          },
+          error:
+            error instanceof ScriptedLlmError
+              ? error.llmError
+              : {
+                  kind: 'unknown',
+                  message: error instanceof Error ? error.message : String(error),
+                },
         });
       }
     },
@@ -208,6 +238,9 @@ export function createScriptedProvider(): ScriptedProvider {
         finishReason: response.finishReason,
         rawFinishReason: response.rawFinishReason,
       });
+    },
+    mockNextError: (error) => {
+      queue.push({ parts: [], error: { ...error } });
     },
     callCount: () => calls.length,
     callHistory: () => calls,

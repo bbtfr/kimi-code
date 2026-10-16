@@ -320,12 +320,47 @@ export class AcpSession {
         this.onCompactionCompleted(event);
       }),
       events.on('compaction.cancelled', () => {
-        this.emitLocalChunk('Compaction cancelled.');
+        this.emitLocalNotice({
+          category: 'context',
+          type: 'context.compaction',
+          name: 'Compaction',
+          body: 'Compaction cancelled.',
+        });
       }),
       events.on('compaction.blocked', () => {
-        this.emitLocalChunk(
-          'Compaction is blocked by the current turn; retry when the turn is idle.',
-        );
+        this.emitLocalNotice({
+          category: 'context',
+          type: 'context.compaction',
+          name: 'Compaction',
+          body: 'Compaction is blocked by the current turn; retry when the turn is idle.',
+        });
+      }),
+      // LLM retry (429 and other retryable failures) and engine warnings/errors
+      // are system notices, not model output — envelope them the same way.
+      events.on('turn.step.retrying', (event) => {
+        this.emitLocalNotice({
+          category: 'system',
+          type: 'llm.retrying',
+          name: 'LLM request retry',
+          title: `Retrying the LLM request (attempt ${event.nextAttempt} of ${event.maxAttempts})`,
+          body: `${event.errorMessage}${event.statusCode !== undefined ? ` (HTTP ${event.statusCode})` : ''}\nNext attempt in ${Math.max(1, Math.round(event.delayMs / 1000))}s.`,
+        });
+      }),
+      events.on('warning', (event) => {
+        this.emitLocalNotice({
+          category: 'system',
+          type: 'system.warning',
+          name: 'Warning',
+          body: event.code !== undefined ? `[${event.code}] ${event.message}` : event.message,
+        });
+      }),
+      events.on('error', (event) => {
+        this.emitLocalNotice({
+          category: 'system',
+          type: 'system.error',
+          name: 'Error',
+          body: event.message,
+        });
       }),
     );
     // Session-scope stream: title changes surface as `session_info_update`.
@@ -881,20 +916,44 @@ export class AcpSession {
    */
   private onCompactionStarted(event: AgentEventPayloads['compaction.started']): void {
     if (event.trigger !== 'auto') return;
-    this.emitLocalChunk(
-      event.instruction === undefined
-        ? 'Compacting conversation context…'
-        : `Compacting conversation context with instruction: ${event.instruction}`,
-    );
+    this.emitLocalNotice({
+      category: 'context',
+      type: 'context.compaction',
+      name: 'Compaction',
+      body:
+        event.instruction === undefined
+          ? 'Compacting conversation context…'
+          : `Compacting conversation context with instruction: ${event.instruction}`,
+    });
   }
 
   /** Report the compaction result (token/message summary). */
   private onCompactionCompleted(event: AgentEventPayloads['compaction.completed']): void {
-    this.emitLocalChunk(formatCompactionCompleted(event.result));
+    this.emitLocalNotice({
+      category: 'context',
+      type: 'context.compaction',
+      name: 'Compaction',
+      body: formatCompactionCompleted(event.result),
+    });
   }
 
-  /** Push one local `agent_message_chunk` (best-effort, never throws). */
-  private emitLocalChunk(text: string): void {
+  /**
+   * Push one local system notice as a single `agent_message_chunk` carrying a
+   * `<notification>` envelope (best-effort, never throws). The envelope marks
+   * the text as a system notification rather than model output, so clients
+   * that understand the convention (Paseo) render it as a notice instead of
+   * assistant text; other ACP clients keep showing the raw text.
+   */
+  private emitLocalNotice(input: {
+    category: string;
+    type: string;
+    name: string;
+    title?: string;
+    body: string;
+  }): void {
+    const text =
+      `<notification source="kimi" category="${input.category}" type="${input.type}" name="${input.name}">` +
+      `Title: ${input.title ?? input.name}\n${input.body}</notification>`;
     this.emit({
       sessionId: this.sessionId,
       update: {
@@ -908,6 +967,16 @@ export class AcpSession {
     const driver = this.driverFor(event.turnId);
     if (driver === undefined) return;
     const error = event.error as { readonly code: string; readonly message?: string } | undefined;
+    // A failed turn otherwise settles as a plain `end_turn` with the error
+    // logged out-of-band — clients would never show what went wrong.
+    if (event.reason === 'failed' && error?.message !== undefined) {
+      this.emitLocalNotice({
+        category: 'system',
+        type: 'turn.failed',
+        name: 'Turn failed',
+        body: error.message,
+      });
+    }
     this.settleDriver(driver, () => {
       // Auth failures must surface as a JSON-RPC `auth_required` error
       // so the client triggers its re-auth flow, not a silent `end_turn`.
