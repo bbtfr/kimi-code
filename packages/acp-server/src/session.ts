@@ -88,6 +88,7 @@ import { log } from './log';
 import { projectModelCatalog } from './model-catalog';
 import { ACP_MODES, type AcpModeId, acpModeToToggles, DEFAULT_MODE_ID } from './modes';
 import { projectHistoryToSessionUpdates, type AcpHistory } from './replay';
+import { SystemMessageProjector } from './system-messages';
 import { buildAcpSkillSlashCommands, detectSlashIntent } from './slash';
 
 /** Leading text of the first text block, if any (used for slash detection). */
@@ -243,6 +244,9 @@ export class AcpSession {
   /** Bridges engine approval / ask-user requests to the ACP client. */
   private readonly interactionBridge: AcpInteractionBridge;
 
+  /** Legacy `<paseo-system>` projection + edit-result dedup (in-process). */
+  private readonly systemMessages: SystemMessageProjector;
+
   constructor(
     private readonly conn: AcpClient,
     klient: Klient,
@@ -270,6 +274,7 @@ export class AcpSession {
     // `main` is auto-materialized by the transport's scope resolution on the
     // first call — no explicit agent bootstrap is needed here.
     this.agent = this.session.agent('main');
+    this.systemMessages = new SystemMessageProjector(sessionId);
     this.interactionBridge = new AcpInteractionBridge(conn, this.session, sessionId, elicitationForm);
   }
 
@@ -453,6 +458,7 @@ export class AcpSession {
         driver.resolve({ stopReason: 'cancelled' });
       });
     }
+    for (const notification of this.systemMessages.end()) this.emitRaw(notification);
     this.interactionBridge.dispose();
     for (const subscription of this.subscriptions.splice(0)) {
       subscription.dispose();
@@ -487,7 +493,7 @@ export class AcpSession {
     const updates = projectHistoryToSessionUpdates(this.sessionId, messages, toolCalls, toolResults);
     for (const update of updates) {
       try {
-        await this.conn.sessionUpdate(update);
+        await this.conn.sessionUpdate(this.systemMessages.transformReplay(update));
       } catch (error) {
         // A single transient push failure must not truncate the whole replay;
         // log and continue so the rest of the history still lands.
@@ -549,6 +555,19 @@ export class AcpSession {
   }
 
   async prompt(blocks: readonly ContentBlock[]): Promise<PromptResponse> {
+    const pendingKey = this.systemMessages.onPrompt(blocks);
+    let response: PromptResponse;
+    try {
+      response = await this.promptInner(blocks);
+    } catch (error) {
+      for (const notification of this.systemMessages.onPromptSettled(pendingKey, false)) this.emitRaw(notification);
+      throw error;
+    }
+    for (const notification of this.systemMessages.onPromptSettled(pendingKey, true)) this.emitRaw(notification);
+    return response;
+  }
+
+  private async promptInner(blocks: readonly ContentBlock[]): Promise<PromptResponse> {
     // Slash-intent detection: builtin commands execute locally without an LLM
     // turn; skills activate through the engine (rendered skill prompt driven
     // as a normal turn); unknown slash commands are answered locally with an
@@ -1083,7 +1102,7 @@ export class AcpSession {
   }
 
   /** Push a `session/update` notification (best-effort, never throws). */
-  private emit(notification: SessionNotification | null): void {
+  private emitRaw(notification: SessionNotification | null): void {
     if (notification === null) return;
     void this.conn.sessionUpdate(notification).catch((error) => {
       log.warn('acp: failed to push session/update', {
@@ -1091,6 +1110,19 @@ export class AcpSession {
         error: error instanceof Error ? error.message : String(error),
       });
     });
+  }
+
+  /**
+   * Live emissions route through the system-message projector (legacy
+   * envelope projection, edit-result dedup, mirror injection). Projector
+   * output is already projected and must go through `emitRaw` — routing it
+   * back through `transform` would double-dedup repeated identical prompts.
+   */
+  private emit(notification: SessionNotification | null): void {
+    if (notification === null) return;
+    for (const projected of this.systemMessages.transform(notification)) {
+      this.emitRaw(projected);
+    }
   }
 
   /**

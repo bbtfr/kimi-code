@@ -211,6 +211,37 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     });
   }, 30_000);
 
+  it('legacy <paseo-system> prompts display as a projected notification, live and on cold load', async () => {
+    let c = await boot();
+    const raw = '<paseo-system>\nSchedule "patrol" fired (id=s1, run=r1).\nRun the patrol.\n</paseo-system>';
+    scripted!.mockNextText('patrol answer');
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const result = (await c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: raw }],
+    })) as { stopReason: string };
+    expect(result.stopReason).toBe('end_turn');
+    const updates = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    const projectedText = (u: SessionNotification['update']) =>
+      (u as { content?: { text?: string } }).content?.text ?? '';
+    const projected = updates.filter(u => projectedText(u).includes('<cron-fire') && projectedText(u).includes('name="patrol"'));
+    expect(projected).toHaveLength(1);
+    const answerAt = updates.findIndex(u => projectedText(u) === 'patrol answer');
+    expect(updates.indexOf(projected[0]!)).toBeLessThan(answerAt);
+    // The raw envelope text never reaches the model-facing display as-is.
+    expect(updates.filter(u => projectedText(u).includes('<paseo-system>'))).toEqual([]);
+
+    await c.close();
+    client = undefined;
+    c = await createTestClient({ homeDir: homeDir!, extraSeeds: [scripted!.seed] });
+    client = c;
+    await c.send('initialize', { protocolVersion: 1, clientCapabilities: {} });
+    await c.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    const replayed = c.sessionUpdates().map(m => (m.params as SessionNotification).update);
+    const replayedProjected = replayed.filter(u => projectedText(u).includes('<cron-fire') && projectedText(u).includes('name="patrol"'));
+    expect(replayedProjected).toHaveLength(1);
+    expect(replayed.filter(u => projectedText(u).includes('<paseo-system>'))).toEqual([]);
+  }, 30_000);
+
   it('keeps reused tool IDs correlated with their original turn on cold load', async () => {
     const c = await boot();
     const path = join(homeDir!, 'repeated-edit.txt');
