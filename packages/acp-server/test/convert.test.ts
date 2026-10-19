@@ -17,6 +17,7 @@ import {
   toolCallLazyCreateToSessionUpdate,
   toolCallStartToSessionUpdate,
   toolCallStartedUpgradeToSessionUpdate,
+  toolResultToSessionUpdate,
 } from '../src/events-map';
 import { solidPng, solidPngBase64 } from './_helpers/png';
 
@@ -306,5 +307,41 @@ describe('structured-kind tool call session updates carry no args preview', () =
       agentId: 'a', turnId: 1, toolCallId: 't2', argumentsPart: ' it"}',
     } as never, acc).update as any;
     expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: '{"prompt":"fix it"}' } }]);
+  });
+});
+
+describe('toolResultToSessionUpdate with a diff display', () => {
+  const editDisplay = {
+    kind: 'file_io',
+    operation: 'edit',
+    path: '/tmp/a.ts',
+    before: 'old',
+    after: 'new',
+  } as const;
+  const resultEvent = (over: Record<string, unknown> = {}) => ({
+    agentId: 'agent-1',
+    turnId: 1,
+    toolCallId: 'Edit_1',
+    output: 'File updated',
+    ...over,
+  }) as never;
+  const diffBlock = { type: 'diff', path: '/tmp/a.ts', oldText: 'old', newText: 'new' };
+
+  it('a successful structured edit carries only the diff; rawOutput preserves the result', () => {
+    const update = toolResultToSessionUpdate('s', resultEvent(), undefined, editDisplay).update as any;
+    expect(update.status).toBe('completed');
+    expect(update.content).toEqual([diffBlock]);
+    expect(update.rawOutput).toBe('File updated');
+  });
+
+  it('a failed edit keeps the error text after the diff', () => {
+    const update = toolResultToSessionUpdate('s', resultEvent({ isError: true, output: 'old_string not found' }), undefined, editDisplay).update as any;
+    expect(update.status).toBe('failed');
+    expect(update.content).toEqual([diffBlock, { type: 'content', content: { type: 'text', text: 'old_string not found' } }]);
+  });
+
+  it('a successful call without a display carries the result text', () => {
+    const update = toolResultToSessionUpdate('s', resultEvent({ output: 'done' })).update as any;
+    expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: 'done' } }]);
   });
 });

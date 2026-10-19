@@ -29,39 +29,6 @@ export function projectSystemMessage(text: string): string | undefined {
   return `<cron-fire source="paseo" jobId="${escapeXml(schedule[2]!)}" runId="${escapeXml(schedule[3]!)}"${name}>\n<prompt>${escapeXml(body)}</prompt>\n</cron-fire>`;
 }
 
-/**
- * Paseo treats any edit text content as a unifiedDiff, overriding the
- * structured diff block. Only remove an exact duplicate of rawOutput; retain
- * errors and any other content. Never mutates the input.
- */
-export function projectEditResult(update: NotificationUpdate): NotificationUpdate {
-  const candidate = update as {
-    sessionUpdate?: string;
-    status?: string;
-    kind?: string;
-    content?: unknown[];
-    rawOutput?: unknown;
-  };
-  if (!['tool_call', 'tool_call_update'].includes(candidate.sessionUpdate ?? '') || candidate.status !== 'completed') {
-    return update;
-  }
-  if (candidate.kind !== undefined && candidate.kind !== null && candidate.kind !== 'edit') return update;
-  if (!Array.isArray(candidate.content) || candidate.rawOutput === undefined || candidate.rawOutput === null) return update;
-  const hasDiff = candidate.content.some((block) => {
-    const item = block as { type?: string; path?: unknown; newText?: unknown; oldText?: unknown };
-    return item.type === 'diff' && typeof item.path === 'string'
-      && typeof item.newText === 'string'
-      && (item.oldText === null || item.oldText === undefined || typeof item.oldText === 'string');
-  });
-  if (!hasDiff) return update;
-  const outputText = typeof candidate.rawOutput === 'string' ? candidate.rawOutput : JSON.stringify(candidate.rawOutput);
-  const content = candidate.content.filter((block) => {
-    const item = block as { type?: string; content?: { type?: string; text?: unknown } };
-    return !(item.type === 'content' && item.content?.type === 'text' && item.content.text === outputText);
-  });
-  return content.length === candidate.content.length ? update : ({ ...update, content } as NotificationUpdate);
-}
-
 const executionUpdates = new Set(['agent_message_chunk', 'agent_thought_chunk', 'tool_call', 'tool_call_update']);
 const prefix = '<paseo-system>\n';
 
@@ -105,14 +72,13 @@ export class SystemMessageProjector {
 
   /**
    * Live emission path: mirror the pending projection before the turn's first
-   * execution update, rewrite user echoes of legacy envelopes, buffer prefix
-   * fragments split across chunks, and dedup edit results. The returned
-   * notifications are already projected — emit them as-is, in order.
+   * execution update, rewrite user echoes of legacy envelopes, and buffer
+   * prefix fragments split across chunks. The returned notifications are
+   * already projected — emit them as-is, in order.
    */
   transform(notification: SessionNotification): SessionNotification[] {
-    const originalUpdate = notification.update;
-    const update = projectEditResult(originalUpdate);
-    const current = update === originalUpdate ? notification : { ...notification, update };
+    const update = notification.update;
+    const current = notification;
     const pending = this.firstPending();
 
     if (update.sessionUpdate === 'user_message_chunk' && update.content?.type === 'text') {
@@ -158,7 +124,7 @@ export class SystemMessageProjector {
   /** Cold replay: complete messages convert directly; no prompt machinery. */
   transformReplay(notification: SessionNotification): SessionNotification {
     const originalUpdate = notification.update;
-    let update = projectEditResult(originalUpdate);
+    let update = originalUpdate;
     if (update.sessionUpdate === 'user_message_chunk' && update.content?.type === 'text') {
       const projected = projectSystemMessage(update.content.text);
       if (projected !== undefined) {

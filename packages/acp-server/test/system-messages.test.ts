@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import type { ContentBlock, SessionNotification } from '@agentclientprotocol/sdk';
 import { describe, expect, it } from 'vitest';
 
-import { projectEditResult, projectSystemMessage, SystemMessageProjector } from '../src/system-messages';
+import { projectSystemMessage, SystemMessageProjector } from '../src/system-messages';
 
 const raw = '<paseo-system>\nSchedule "Check & report" fired (id=s1, run=r1).\nRead <file> & report.\n</paseo-system>';
 const projected = projectSystemMessage(raw)!;
@@ -16,47 +16,6 @@ const update = (
 ): SessionNotification => ({
   sessionId: 'session',
   update: { sessionUpdate, messageId, content: { type: 'text', text } } as SessionNotification['update'],
-});
-const toolResult = (fields: Record<string, unknown> = {}): SessionNotification => ({
-  sessionId: 'session',
-  update: {
-    sessionUpdate: 'tool_call_update', toolCallId: '1:edit', status: 'completed',
-    content: [
-      { type: 'diff', path: '/example/file.txt', oldText: 'before\n', newText: 'after\n' },
-      { type: 'content', content: { type: 'text', text: 'File updated' } },
-    ],
-    rawOutput: 'File updated',
-    ...fields,
-  } as unknown as SessionNotification['update'],
-});
-
-describe('projectEditResult', () => {
-  it('successful structured edits retain diff and raw output without a duplicate text override', () => {
-    for (const rawOutput of ['File updated', { message: 'File updated' }, [{ type: 'text', text: 'File updated' }]]) {
-      const text = typeof rawOutput === 'string' ? rawOutput : JSON.stringify(rawOutput);
-      const input = toolResult({ rawOutput, content: [
-        { type: 'diff', path: '/example/file.txt', oldText: 'before\n', newText: 'after\n' },
-        { type: 'content', content: { type: 'text', text } },
-      ] });
-      const before = structuredClone(input);
-      const update = projectEditResult(input.update);
-      assert.deepEqual((update as { content?: unknown[] }).content, [{ type: 'diff', path: '/example/file.txt', oldText: 'before\n', newText: 'after\n' }]);
-      assert.deepEqual(input, before, 'the original payload must not be mutated');
-      assert.deepEqual(projectEditResult(update), update, 'projection is idempotent');
-    }
-  });
-
-  it('leaves failures, pending tools and nonredundant content untouched', () => {
-    for (const fields of [
-      { status: 'failed' }, { status: 'in_progress' }, { status: 'pending' },
-      { kind: 'execute' }, { kind: 'read' }, { rawOutput: undefined },
-      { rawOutput: 'Different output' },
-      { content: [{ type: 'content', content: { type: 'text', text: 'File updated' } }] },
-    ]) {
-      const input = toolResult(fields);
-      assert.equal(projectEditResult(input.update), input.update);
-    }
-  });
 });
 
 describe('SystemMessageProjector', () => {

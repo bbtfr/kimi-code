@@ -402,7 +402,7 @@ export function toolResultToSessionUpdate(
       toolCallId: acpToolCallId(event.turnId, event.toolCallId),
       status: event.isError ? 'failed' : 'completed',
       title,
-      content: withToolDisplay(toolResultToAcpContent(event), display),
+      content: withToolDisplay(toolResultToAcpContent(event), display, event.isError),
       rawOutput: event.output,
       locations,
     },
@@ -558,8 +558,14 @@ export function sessionInfoUpdateNotification(
 export function withToolDisplay(
   content: ToolCallContent[],
   display?: ToolInputDisplay,
+  isError?: boolean,
 ): ToolCallContent[] {
   const block = display === undefined ? null : displayBlockToAcpContent(display);
+  // A successful call with a structured diff carries the diff only: the
+  // textual output duplicates it (rawOutput preserves the full result), and
+  // some clients render text content in place of the diff. Failures keep
+  // their error text.
+  if (block !== null && isError !== true) return [block];
   return block === null ? content : [block, ...content];
 }
 
