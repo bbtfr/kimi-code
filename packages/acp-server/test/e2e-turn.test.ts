@@ -883,26 +883,30 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     const textOf = (u: ToolCallWire | undefined) =>
       u?.content?.map((entry) => entry.content?.text ?? '').join('') ?? '';
 
-    // 1. First delta → lazy CREATE: pending, titled by the tool name, content
-    //    is the first args fragment, no rawInput yet.
+    // 1. First delta → lazy CREATE: pending, titled by the tool name, no
+    //    rawInput yet. Structured kinds suppress the args preview, so the
+    //    content stays empty until the result lands.
     expect(updates[0]?.sessionUpdate).toBe('tool_call');
     expect(updates[0]?.status).toBe('pending');
     expect(updates[0]?.title).toBe('Bash');
     expect(updates[0]?.kind).toBe('execute');
     expect(updates[0]?.rawInput).toBeUndefined();
-    expect(textOf(updates[0])).toBe('{"command":"ec');
+    expect(textOf(updates[0])).toBe('');
 
-    // 2. Second delta → cumulative REPLACE update with the full args text.
+    // 2. Second delta → cumulative REPLACE update; execute-kind previews are
+    //    suppressed, so no args text streams.
     expect(updates[1]?.sessionUpdate).toBe('tool_call_update');
     expect(updates[1]?.status).toBe('in_progress');
-    expect(textOf(updates[1])).toBe('{"command":"echo delta_stream"}');
+    expect(textOf(updates[1])).toBe('');
 
     // 3. `tool.call.started` → upgrade update: canonical metadata lands on the
-    //    existing card (kind + rawInput), status stays in_progress.
+    //    existing card (kind + rawInput), status stays in_progress, still no
+    //    args preview.
     expect(updates[2]?.sessionUpdate).toBe('tool_call_update');
     expect(updates[2]?.status).toBe('in_progress');
     expect(updates[2]?.kind).toBe('execute');
     expect(updates[2]?.rawInput).toEqual({ command: 'echo delta_stream' });
+    expect(textOf(updates[2])).toBe('');
 
     // 4. Result → terminal completed update carrying the command output.
     const terminal = updates.at(-1);

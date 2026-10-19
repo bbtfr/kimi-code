@@ -124,9 +124,10 @@ export function acpToolCallId(turnId: number, toolCallId: string): string {
 export function inferToolKind(name: string): ToolKind {
   switch (name) {
     case 'Read':
+      return 'read';
     case 'Glob':
     case 'Grep':
-      return 'read';
+      return 'search';
     case 'Write':
     case 'Edit':
       return 'edit';
@@ -141,6 +142,16 @@ export function inferToolKind(name: string): ToolKind {
     default:
       return 'other';
   }
+}
+
+/**
+ * Tools with a structured detail view on the client: an args JSON preview
+ * only leaks into the unifiedDiff / output / content slots there (the daemon
+ * maps text content into them), so it is suppressed. Unknown ('other') tools
+ * keep the preview — it is their only visible content.
+ */
+function suppressArgsPreview(name: string | undefined): boolean {
+  return name !== undefined && inferToolKind(name) !== 'other';
 }
 
 /**
@@ -210,12 +221,13 @@ export function toolCallStartToSessionUpdate(
   // the daemon maps any edit-kind text content to unifiedDiff, where it
   // overrides the structured diff and renders as raw JSON.
   const displayContent = event.display ? displayBlockToAcpContent(event.display) : null;
-  const content: ToolCallContent[] = displayContent !== null ? [displayContent] : [
-    {
-      type: 'content',
-      content: { type: 'text', text: stringifyArgs(event.args) },
-    },
-  ];
+  const content: ToolCallContent[] = displayContent !== null ? [displayContent]
+    : suppressArgsPreview(event.name) ? [] : [
+      {
+        type: 'content',
+        content: { type: 'text', text: stringifyArgs(event.args) },
+      },
+    ];
   return {
     sessionId,
     update: {
@@ -239,13 +251,11 @@ export function toolCallStartToSessionUpdate(
 export function toolCallDeltaToSessionUpdate(
   sessionId: string,
   event: ToolCallDeltaEvent,
-  accumulator: { args: string; editKind?: boolean },
+  accumulator: { args: string; suppressArgs?: boolean },
 ): SessionNotification {
   accumulator.args += event.argumentsPart ?? '';
-  accumulator.editKind = accumulator.editKind || (event.name !== undefined && inferToolKind(event.name) === 'edit');
-  // Edit-kind args previews duplicate the upcoming diff block and are mapped
-  // to unifiedDiff by the daemon, rendering as raw JSON while streaming.
-  const content: ToolCallContent[] = accumulator.editKind ? [] : [
+  accumulator.suppressArgs = accumulator.suppressArgs || suppressArgsPreview(event.name);
+  const content: ToolCallContent[] = accumulator.suppressArgs ? [] : [
     {
       type: 'content',
       content: { type: 'text', text: accumulator.args },
@@ -277,7 +287,6 @@ export function toolCallLazyCreateToSessionUpdate(
   event: ToolCallDeltaEvent,
 ): SessionNotification {
   const name = event.name ?? 'tool';
-  const editKind = event.name !== undefined && inferToolKind(event.name) === 'edit';
   return {
     sessionId,
     update: {
@@ -286,7 +295,7 @@ export function toolCallLazyCreateToSessionUpdate(
       title: name,
       kind: event.name ? inferToolKind(event.name) : 'other',
       status: 'pending',
-      content: editKind ? [] : [
+      content: suppressArgsPreview(event.name) ? [] : [
         {
           type: 'content',
           content: { type: 'text', text: event.argumentsPart ?? '' },
@@ -309,12 +318,13 @@ export function toolCallStartedUpgradeToSessionUpdate(
 ): SessionNotification {
   const title = event.description ?? event.name;
   const displayContent = event.display ? displayBlockToAcpContent(event.display) : null;
-  const content: ToolCallContent[] = displayContent !== null ? [displayContent] : [
-    {
-      type: 'content',
-      content: { type: 'text', text: stringifyArgs(event.args) },
-    },
-  ];
+  const content: ToolCallContent[] = displayContent !== null ? [displayContent]
+    : suppressArgsPreview(event.name) ? [] : [
+      {
+        type: 'content',
+        content: { type: 'text', text: stringifyArgs(event.args) },
+      },
+    ];
   return {
     sessionId,
     update: {

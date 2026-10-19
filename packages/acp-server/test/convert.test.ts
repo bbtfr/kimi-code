@@ -201,7 +201,7 @@ describe('displayBlockToAcpContent', () => {
   });
 });
 
-describe('edit-kind tool call session updates carry no args preview', () => {
+describe('structured-kind tool call session updates carry no args preview', () => {
   const editDisplay = {
     kind: 'file_io',
     operation: 'edit',
@@ -223,14 +223,24 @@ describe('edit-kind tool call session updates carry no args preview', () => {
     expect(update.content).toEqual([{ type: 'diff', path: '/tmp/a.ts', oldText: 'old', newText: 'new' }]);
   });
 
-  it('start without a display keeps the args preview', () => {
+  it('start without a display suppresses the args preview for structured kinds', () => {
     const update = toolCallStartToSessionUpdate('s', startedEvent({ name: 'Bash', args: { command: 'ls' } })).update as any;
-    expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: '{"command":"ls"}' } }]);
+    expect(update.content).toEqual([]);
+  });
+
+  it('start without a display keeps the args preview for unknown (other) tools', () => {
+    const update = toolCallStartToSessionUpdate('s', startedEvent({ name: 'Task', args: { prompt: 'patrol' } })).update as any;
+    expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: '{"prompt":"patrol"}' } }]);
   });
 
   it('started-upgrade after a lazy create also drops the args preview when a diff exists', () => {
     const update = toolCallStartedUpgradeToSessionUpdate('s', startedEvent({ display: editDisplay })).update as any;
     expect(update.content).toEqual([{ type: 'diff', path: '/tmp/a.ts', oldText: 'old', newText: 'new' }]);
+  });
+
+  it('started-upgrade without a display suppresses the args preview for structured kinds', () => {
+    const update = toolCallStartedUpgradeToSessionUpdate('s', startedEvent({ name: 'Read', args: { path: '/tmp/a.ts' } })).update as any;
+    expect(update.content).toEqual([]);
   });
 
   it('lazy create for an edit-kind tool starts with empty content', () => {
@@ -240,14 +250,29 @@ describe('edit-kind tool call session updates carry no args preview', () => {
     expect(update.content).toEqual([]);
   });
 
-  it('lazy create for other tools keeps the streaming fragment', () => {
+  it('lazy create for a shell tool starts with empty content', () => {
     const update = toolCallLazyCreateToSessionUpdate('s', {
       agentId: 'a', turnId: 1, toolCallId: 'Bash_1', name: 'Bash', argumentsPart: '{"command"',
     } as never).update as any;
-    expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: '{"command"' } }]);
+    expect(update.content).toEqual([]);
   });
 
-  it('deltas for edit-kind tools stay empty once the kind is seen, even when the name arrives late', () => {
+  it('lazy create maps Glob/Grep to the search kind', () => {
+    const update = toolCallLazyCreateToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 'Grep_1', name: 'Grep', argumentsPart: '{"pattern"',
+    } as never).update as any;
+    expect(update.kind).toBe('search');
+    expect(update.content).toEqual([]);
+  });
+
+  it('lazy create for other tools keeps the streaming fragment', () => {
+    const update = toolCallLazyCreateToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 'Task_1', name: 'Task', argumentsPart: '{"prompt"',
+    } as never).update as any;
+    expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: '{"prompt"' } }]);
+  });
+
+  it('deltas for structured-kind tools stay empty once the kind is seen, even when the name arrives late', () => {
     const acc = { args: '' };
     const first = toolCallDeltaToSessionUpdate('s', {
       agentId: 'a', turnId: 1, toolCallId: 't1', argumentsPart: '{"path"',
@@ -264,14 +289,22 @@ describe('edit-kind tool call session updates carry no args preview', () => {
     expect(acc.args).toBe('{"path","old_string":"x","new_string":"y"}');
   });
 
-  it('deltas for non-edit tools keep the cumulative preview', () => {
+  it('deltas for shell tools stay empty', () => {
+    const acc = { args: '' };
+    const update = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't3', name: 'Bash', argumentsPart: '{"command":"ls"',
+    } as never, acc).update as any;
+    expect(update.content).toEqual([]);
+  });
+
+  it('deltas for other tools keep the cumulative preview', () => {
     const acc = { args: '' };
     toolCallDeltaToSessionUpdate('s', {
-      agentId: 'a', turnId: 1, toolCallId: 't2', name: 'Bash', argumentsPart: '{"command":"ls',
+      agentId: 'a', turnId: 1, toolCallId: 't2', name: 'Task', argumentsPart: '{"prompt":"fix',
     } as never, acc);
     const update = toolCallDeltaToSessionUpdate('s', {
-      agentId: 'a', turnId: 1, toolCallId: 't2', argumentsPart: ' -la"}',
+      agentId: 'a', turnId: 1, toolCallId: 't2', argumentsPart: ' it"}',
     } as never, acc).update as any;
-    expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: '{"command":"ls -la"}' } }]);
+    expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: '{"prompt":"fix it"}' } }]);
   });
 });
