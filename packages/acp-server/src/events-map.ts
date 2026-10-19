@@ -206,20 +206,16 @@ export function toolCallStartToSessionUpdate(
   event: ToolCallStartedEvent,
 ): SessionNotification {
   const title = event.description ?? event.name;
-  const content: ToolCallContent[] = [
+  // A display block (diff/plan) replaces the textual args preview entirely:
+  // the daemon maps any edit-kind text content to unifiedDiff, where it
+  // overrides the structured diff and renders as raw JSON.
+  const displayContent = event.display ? displayBlockToAcpContent(event.display) : null;
+  const content: ToolCallContent[] = displayContent !== null ? [displayContent] : [
     {
       type: 'content',
       content: { type: 'text', text: stringifyArgs(event.args) },
     },
   ];
-  // If the tool attached a diff-bearing display, prepend an inline diff entry
-  // so the client can render it alongside the textual args preview.
-  if (event.display) {
-    const diff = displayBlockToAcpContent(event.display);
-    if (diff !== null) {
-      content.unshift(diff);
-    }
-  }
   return {
     sessionId,
     update: {
@@ -243,21 +239,25 @@ export function toolCallStartToSessionUpdate(
 export function toolCallDeltaToSessionUpdate(
   sessionId: string,
   event: ToolCallDeltaEvent,
-  accumulator: { args: string },
+  accumulator: { args: string; editKind?: boolean },
 ): SessionNotification {
   accumulator.args += event.argumentsPart ?? '';
+  accumulator.editKind = accumulator.editKind || (event.name !== undefined && inferToolKind(event.name) === 'edit');
+  // Edit-kind args previews duplicate the upcoming diff block and are mapped
+  // to unifiedDiff by the daemon, rendering as raw JSON while streaming.
+  const content: ToolCallContent[] = accumulator.editKind ? [] : [
+    {
+      type: 'content',
+      content: { type: 'text', text: accumulator.args },
+    },
+  ];
   return {
     sessionId,
     update: {
       sessionUpdate: 'tool_call_update',
       toolCallId: acpToolCallId(event.turnId, event.toolCallId),
       status: 'in_progress',
-      content: [
-        {
-          type: 'content',
-          content: { type: 'text', text: accumulator.args },
-        },
-      ],
+      content,
     },
   };
 }
@@ -277,6 +277,7 @@ export function toolCallLazyCreateToSessionUpdate(
   event: ToolCallDeltaEvent,
 ): SessionNotification {
   const name = event.name ?? 'tool';
+  const editKind = event.name !== undefined && inferToolKind(event.name) === 'edit';
   return {
     sessionId,
     update: {
@@ -285,7 +286,7 @@ export function toolCallLazyCreateToSessionUpdate(
       title: name,
       kind: event.name ? inferToolKind(event.name) : 'other',
       status: 'pending',
-      content: [
+      content: editKind ? [] : [
         {
           type: 'content',
           content: { type: 'text', text: event.argumentsPart ?? '' },
@@ -307,18 +308,13 @@ export function toolCallStartedUpgradeToSessionUpdate(
   event: ToolCallStartedEvent,
 ): SessionNotification {
   const title = event.description ?? event.name;
-  const content: ToolCallContent[] = [
+  const displayContent = event.display ? displayBlockToAcpContent(event.display) : null;
+  const content: ToolCallContent[] = displayContent !== null ? [displayContent] : [
     {
       type: 'content',
       content: { type: 'text', text: stringifyArgs(event.args) },
     },
   ];
-  if (event.display) {
-    const diff = displayBlockToAcpContent(event.display);
-    if (diff !== null) {
-      content.unshift(diff);
-    }
-  }
   return {
     sessionId,
     update: {

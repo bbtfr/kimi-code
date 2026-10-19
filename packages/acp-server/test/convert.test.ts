@@ -12,6 +12,12 @@ import {
   compressPromptImageParts,
   displayBlockToAcpContent,
 } from '../src/convert';
+import {
+  toolCallDeltaToSessionUpdate,
+  toolCallLazyCreateToSessionUpdate,
+  toolCallStartToSessionUpdate,
+  toolCallStartedUpgradeToSessionUpdate,
+} from '../src/events-map';
 import { solidPng, solidPngBase64 } from './_helpers/png';
 
 describe('acpMcpServersToConfigRecord', () => {
@@ -192,5 +198,80 @@ describe('displayBlockToAcpContent', () => {
     expect(
       displayBlockToAcpContent({ kind: 'file_io', operation: 'read', path: '/tmp/a.ts' }),
     ).toBeNull();
+  });
+});
+
+describe('edit-kind tool call session updates carry no args preview', () => {
+  const editDisplay = {
+    kind: 'file_io',
+    operation: 'edit',
+    path: '/tmp/a.ts',
+    before: 'old',
+    after: 'new',
+  } as const;
+  const startedEvent = (over: Record<string, unknown> = {}) => ({
+    agentId: 'agent-1',
+    turnId: 1,
+    toolCallId: 'Edit_1',
+    name: 'Edit',
+    args: { path: '/tmp/a.ts', old_string: 'old', new_string: 'new' },
+    ...over,
+  }) as never;
+
+  it('start with a diff display carries only the diff, no args JSON', () => {
+    const update = toolCallStartToSessionUpdate('s', startedEvent({ display: editDisplay })).update as any;
+    expect(update.content).toEqual([{ type: 'diff', path: '/tmp/a.ts', oldText: 'old', newText: 'new' }]);
+  });
+
+  it('start without a display keeps the args preview', () => {
+    const update = toolCallStartToSessionUpdate('s', startedEvent({ name: 'Bash', args: { command: 'ls' } })).update as any;
+    expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: '{"command":"ls"}' } }]);
+  });
+
+  it('started-upgrade after a lazy create also drops the args preview when a diff exists', () => {
+    const update = toolCallStartedUpgradeToSessionUpdate('s', startedEvent({ display: editDisplay })).update as any;
+    expect(update.content).toEqual([{ type: 'diff', path: '/tmp/a.ts', oldText: 'old', newText: 'new' }]);
+  });
+
+  it('lazy create for an edit-kind tool starts with empty content', () => {
+    const update = toolCallLazyCreateToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 'Edit_1', name: 'Edit', argumentsPart: '{"path"',
+    } as never).update as any;
+    expect(update.content).toEqual([]);
+  });
+
+  it('lazy create for other tools keeps the streaming fragment', () => {
+    const update = toolCallLazyCreateToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 'Bash_1', name: 'Bash', argumentsPart: '{"command"',
+    } as never).update as any;
+    expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: '{"command"' } }]);
+  });
+
+  it('deltas for edit-kind tools stay empty once the kind is seen, even when the name arrives late', () => {
+    const acc = { args: '' };
+    const first = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't1', argumentsPart: '{"path"',
+    } as never, acc).update as any;
+    expect(first.content).toHaveLength(1);
+    const second = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't1', name: 'Edit', argumentsPart: ',"old_string":"x"',
+    } as never, acc).update as any;
+    expect(second.content).toEqual([]);
+    const third = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't1', argumentsPart: ',"new_string":"y"}',
+    } as never, acc).update as any;
+    expect(third.content).toEqual([]);
+    expect(acc.args).toBe('{"path","old_string":"x","new_string":"y"}');
+  });
+
+  it('deltas for non-edit tools keep the cumulative preview', () => {
+    const acc = { args: '' };
+    toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't2', name: 'Bash', argumentsPart: '{"command":"ls',
+    } as never, acc);
+    const update = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't2', argumentsPart: ' -la"}',
+    } as never, acc).update as any;
+    expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: '{"command":"ls -la"}' } }]);
   });
 });
