@@ -370,3 +370,25 @@ describe('toolCallLocations by tool kind', () => {
     expect(edit.locations).toEqual([{ path: '/tmp/a.ts' }]);
   });
 });
+
+describe('toolCallDeltaToSessionUpdate rawInput forwarding', () => {
+  it('forwards rawInput as soon as the streaming args JSON parses, preview text still suppressed', () => {
+    const acc = { args: '' };
+    toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't1', name: 'Bash', argumentsPart: '{"command":"ec',
+    } as never, acc);
+    const second = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't1', name: 'Bash', argumentsPart: 'ho hi"}',
+    } as never, acc).update as any;
+    expect(second.rawInput).toEqual({ command: 'echo hi' });
+    expect(second.content).toEqual([]);
+  });
+
+  it('omits rawInput while the args are incomplete JSON', () => {
+    const acc = { args: '' };
+    const first = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't2', name: 'Bash', argumentsPart: '{"command":"ec',
+    } as never, acc).update as any;
+    expect(first.rawInput).toBeUndefined();
+  });
+});

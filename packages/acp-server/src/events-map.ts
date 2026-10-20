@@ -265,12 +265,19 @@ export function toolCallDeltaToSessionUpdate(
       content: { type: 'text', text: accumulator.args },
     },
   ];
+  // The preview text stays suppressed for structured kinds, but rawInput is
+  // data, not display: forward it as soon as the args JSON parses so clients
+  // can show the command even before tool.call.started — or after a cancel
+  // that lands mid-stream.
+  let rawInput: unknown;
+  try { rawInput = JSON.parse(accumulator.args); } catch { rawInput = undefined; }
   return {
     sessionId,
     update: {
       sessionUpdate: 'tool_call_update',
       toolCallId: acpToolCallId(event.turnId, event.toolCallId),
       status: 'in_progress',
+      ...(rawInput !== undefined ? { rawInput } : {}),
       content,
     },
   };
