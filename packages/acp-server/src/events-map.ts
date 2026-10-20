@@ -259,18 +259,21 @@ export function toolCallDeltaToSessionUpdate(
 ): SessionNotification {
   accumulator.args += event.argumentsPart ?? '';
   accumulator.suppressArgs = accumulator.suppressArgs || suppressArgsPreview(event.name);
-  const content: ToolCallContent[] = accumulator.suppressArgs ? [] : [
-    {
-      type: 'content',
-      content: { type: 'text', text: accumulator.args },
-    },
-  ];
   // The preview text stays suppressed for structured kinds, but rawInput is
   // data, not display: forward it as soon as the args JSON parses so clients
   // can show the command even before tool.call.started — or after a cancel
-  // that lands mid-stream.
+  // that lands mid-stream. Edit/Write additionally get a live diff block so
+  // the original→new comparison renders during streaming.
   let rawInput: unknown;
   try { rawInput = JSON.parse(accumulator.args); } catch { rawInput = undefined; }
+  const diff = rawInput !== undefined ? editDiffFromArgs(event.name, rawInput) : null;
+  const content: ToolCallContent[] = diff !== null ? [diff]
+    : accumulator.suppressArgs ? [] : [
+      {
+        type: 'content',
+        content: { type: 'text', text: accumulator.args },
+      },
+    ];
   return {
     sessionId,
     update: {
@@ -281,6 +284,20 @@ export function toolCallDeltaToSessionUpdate(
       content,
     },
   };
+}
+
+/** Build an inline diff from parsed Edit/Write args; null for anything else. */
+function editDiffFromArgs(name: string | undefined, args: unknown): ToolCallContent | null {
+  if (inferToolKind(name ?? '') !== 'edit' || args === null || typeof args !== 'object') return null;
+  const record = args as { path?: unknown; old_string?: unknown; new_string?: unknown; content?: unknown };
+  if (typeof record.path !== 'string') return null;
+  if (typeof record.old_string === 'string' && typeof record.new_string === 'string') {
+    return { type: 'diff', path: record.path, oldText: record.old_string, newText: record.new_string };
+  }
+  if (typeof record.content === 'string') {
+    return { type: 'diff', path: record.path, oldText: null, newText: record.content };
+  }
+  return null;
 }
 
 /**

@@ -392,3 +392,24 @@ describe('toolCallDeltaToSessionUpdate rawInput forwarding', () => {
     expect(first.rawInput).toBeUndefined();
   });
 });
+
+describe('toolCallDeltaToSessionUpdate live edit diffs', () => {
+  it('emits an old→new diff block for Edit once the args parse', () => {
+    const acc = { args: '' };
+    const update = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't3', name: 'Edit',
+      argumentsPart: '{"path":"/tmp/a.ts","old_string":"before","new_string":"after"}',
+    } as never, acc).update as any;
+    expect(update.content).toEqual([{ type: 'diff', path: '/tmp/a.ts', oldText: 'before', newText: 'after' }]);
+    expect(update.rawInput).toEqual({ path: '/tmp/a.ts', old_string: 'before', new_string: 'after' });
+  });
+
+  it('emits a null-oldText diff for Write content', () => {
+    const acc = { args: '' };
+    const update = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't4', name: 'Write',
+      argumentsPart: '{"path":"/tmp/n.md","content":"# hi\\n"}',
+    } as never, acc).update as any;
+    expect(update.content).toEqual([{ type: 'diff', path: '/tmp/n.md', oldText: null, newText: '# hi\n' }]);
+  });
+});
