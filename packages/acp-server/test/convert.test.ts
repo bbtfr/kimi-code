@@ -345,3 +345,28 @@ describe('toolResultToSessionUpdate with a diff display', () => {
     expect(update.content).toEqual([{ type: 'content', content: { type: 'text', text: 'done' } }]);
   });
 });
+
+describe('toolCallLocations by tool kind', () => {
+  const startedEvent = (over: Record<string, unknown> = {}) => ({
+    agentId: 'agent-1',
+    turnId: 1,
+    toolCallId: 'c1',
+    name: 'Edit',
+    args: { path: '/tmp/a.ts', old_string: 'old', new_string: 'new' },
+    ...over,
+  }) as never;
+
+  it('drops locations for search tools (the search root is not a result file)', () => {
+    const grep = toolCallStartToSessionUpdate('s', startedEvent({ name: 'Grep', args: { pattern: 'x', path: '/tmp' } })).update as any;
+    expect(grep.locations).toBeUndefined();
+    const glob = toolCallStartToSessionUpdate('s', startedEvent({ name: 'Glob', args: { pattern: '*.ts', path: '/tmp' } })).update as any;
+    expect(glob.locations).toBeUndefined();
+  });
+
+  it('keeps locations for file tools (a real file link)', () => {
+    const read = toolCallStartToSessionUpdate('s', startedEvent({ name: 'Read', args: { path: '/tmp/a.ts' } })).update as any;
+    expect(read.locations).toEqual([{ path: '/tmp/a.ts' }]);
+    const edit = toolCallStartToSessionUpdate('s', startedEvent()).update as any;
+    expect(edit.locations).toEqual([{ path: '/tmp/a.ts' }]);
+  });
+});

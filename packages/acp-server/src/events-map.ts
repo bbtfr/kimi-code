@@ -197,6 +197,10 @@ export function toolCallLocations(
   args: unknown,
   display: ToolInputDisplay | undefined,
 ): ToolCallLocation[] | undefined {
+  // Search tools (Grep/Glob): the location is the search root, not a file the
+  // call produces — clients render it as a bare path line that reads as
+  // spilled output. Edit/Write/Read keep theirs (a real file link).
+  if (inferToolKind(name) === 'search') return undefined;
   const displayPath =
     display !== undefined && (display.kind === 'diff' || display.kind === 'file_io')
       ? display.path
