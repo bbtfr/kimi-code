@@ -18,9 +18,10 @@ import type {
   SessionApprovalRequest as ApprovalRequest,
   SessionApprovalResponse as ApprovalResponse,
 } from '@moonshot-ai/agent-core-v2';
+import type { ToolInputDisplay } from '@moonshot-ai/agent-core-v2/tool/toolInputDisplay';
 
 import { displayBlockToAcpContent } from './convert';
-import { acpToolCallId } from './events-map';
+import { acpToolCallId, inferToolKind } from './events-map';
 
 /**
  * Canonical option ids surfaced to the ACP client.
@@ -219,8 +220,21 @@ export function buildPermissionToolCallUpdate(req: ApprovalRequest): ToolCallUpd
   return {
     toolCallId,
     title: req.toolName,
+    // The approval prompt fires at preflight, BEFORE tool.call.started — the
+    // client has no rawInput yet, so rebuild it from the display block or the
+    // command detail falls back to a bare tool name.
+    kind: inferToolKind(req.toolName),
+    rawInput: permissionRawInput(req.display),
     content,
   };
+}
+
+function permissionRawInput(display: ToolInputDisplay): Record<string, unknown> | undefined {
+  if (display.kind === 'command') {
+    return { command: display.command, ...(display.cwd !== undefined ? { cwd: display.cwd } : {}) };
+  }
+  if (display.kind === 'file_io') return { path: display.path };
+  return undefined;
 }
 
 /**

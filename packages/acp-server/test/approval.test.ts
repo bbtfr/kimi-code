@@ -196,3 +196,29 @@ describe('attachSelectedLabel', () => {
     expect(result).toEqual({ decision: 'cancelled' });
   });
 });
+
+describe('buildPermissionToolCallUpdate rawInput reconstruction', () => {
+  it('rebuilds command rawInput and kind for Bash (preflight, before tool.call.started)', async () => {
+    const { buildPermissionToolCallUpdate } = await import('../src/approval');
+    const update = buildPermissionToolCallUpdate({
+      toolCallId: 'call_1',
+      toolName: 'Bash',
+      action: 'Running: npm test',
+      display: { kind: 'command', command: 'npm test', cwd: '/repo' },
+    } as never);
+    expect(update.kind).toBe('execute');
+    expect(update.rawInput).toEqual({ command: 'npm test', cwd: '/repo' });
+  });
+
+  it('rebuilds path rawInput for file tools', async () => {
+    const { buildPermissionToolCallUpdate } = await import('../src/approval');
+    const update = buildPermissionToolCallUpdate({
+      toolCallId: 'call_2',
+      toolName: 'Edit',
+      action: 'Editing /repo/a.ts',
+      display: { kind: 'file_io', operation: 'edit', path: '/repo/a.ts', before: 'old', after: 'new' },
+    } as never);
+    expect(update.kind).toBe('edit');
+    expect(update.rawInput).toEqual({ path: '/repo/a.ts' });
+  });
+});

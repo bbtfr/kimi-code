@@ -1514,6 +1514,27 @@ describe('acp-server terminal reverse-RPC (clientCapabilities.terminal)', () => 
     const text = completed?.content?.map((entry) => entry.content?.text ?? '').join('\n') ?? '';
     expect(text).toContain('hello_from_bash');
   }, 30_000);
+
+  it('bash permission request carries kind and command rawInput for preflight approval', async () => {
+    const c = await boot({});
+    c.onRequest('session/request_permission', (params) => {
+      const toolCall = (params as { toolCall?: Record<string, unknown> }).toolCall!;
+      expect(toolCall['kind']).toBe('execute');
+      expect(toolCall['rawInput']).toEqual({ command: 'echo perm-probe-789', cwd: homeDir });
+      return { outcome: { outcome: 'selected', optionId: 'approve_once' } };
+    });
+    scripted!.mockNextResponse({
+      type: 'function', id: 'bash_call', name: 'Bash',
+      arguments: JSON.stringify({ command: 'echo perm-probe-789' }),
+    });
+    scripted!.mockNextText('done');
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    await c.waitForSessionUpdate('available_commands_update', 10_000);
+    const result = await c.send('session/prompt', { sessionId: created.sessionId, prompt: [{ type: 'text', text: 'run it' }] }) as { stopReason: string };
+    expect(result.stopReason).toBe('end_turn');
+    await c.close();
+  }, 30_000);
+
 });
 
 describe('ACP turn outcome mapping', () => {
