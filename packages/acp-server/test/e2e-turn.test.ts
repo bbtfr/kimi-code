@@ -1240,6 +1240,15 @@ describe('acp-server builtin slash commands (local execution, no LLM turn)', () 
     expect(completion).toContain('Messages compacted:');
     expect(completion).toContain('Tokens before:');
     expect(completion).toContain('Tokens after:');
+    // Every notice carries its own messageId so clients never merge
+    // consecutive notices into one unparsable concatenated item.
+    const noticeIds = c.sessionUpdates()
+      .map((m) => (m.params as SessionNotification).update)
+      .filter((u) => u.sessionUpdate === 'agent_message_chunk')
+      .map((u) => (u as { messageId?: string }).messageId)
+      .filter((id): id is string => id?.startsWith('notice:') ?? false);
+    expect(noticeIds.length).toBeGreaterThanOrEqual(1);
+    expect(new Set(noticeIds).size).toBe(noticeIds.length);
     const summaries = (connection: TestClient) => connection.sessionUpdates()
       .map(m => (m.params as SessionNotification).update)
       .filter(u => u.sessionUpdate === 'user_message_chunk' && u.content.type === 'text' && u.content.text.includes('type="context.compaction"'));

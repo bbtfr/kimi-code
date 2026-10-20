@@ -30,6 +30,7 @@ import type {
   ToolCallLocation,
 } from '@agentclientprotocol/sdk';
 import { RequestError } from '@agentclientprotocol/sdk';
+import { randomUUID } from 'node:crypto';
 import { assistantStepMessageId, createContextTranscriptReducer, type ContextMessage } from '@moonshot-ai/agent-core-v2';
 import type {
   AgentEventPayloads,
@@ -1008,6 +1009,10 @@ export class AcpSession {
       sessionId: this.sessionId,
       update: {
         sessionUpdate: 'agent_message_chunk',
+        // A distinct message id per notice: without one, consecutive notices
+        // merge into a single timeline item whose concatenated envelopes no
+        // longer parse as a whole.
+        messageId: `notice:${randomUUID()}`,
         content: { type: 'text', text },
       },
     });
