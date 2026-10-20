@@ -280,10 +280,20 @@ export function toolCallDeltaToSessionUpdate(
       sessionUpdate: 'tool_call_update',
       toolCallId: acpToolCallId(event.turnId, event.toolCallId),
       status: 'in_progress',
+      // Live generation feedback rides the title — the one slot clients never
+      // reinterpret as output/diff. Once args parse, structured data takes over.
+      ...(rawInput === undefined ? { title: argsPreviewTitle(accumulator.args) } : {}),
       ...(rawInput !== undefined ? { rawInput } : {}),
       content,
     },
   };
+}
+
+/** Compact tail of the streaming args for the live title preview. */
+function argsPreviewTitle(args: string): string {
+  const compact = args.replaceAll(/\s+/g, ' ').trim();
+  const tail = compact.length > 40 ? `…${compact.slice(-40)}` : compact;
+  return `Generating args… ${tail}`;
 }
 
 /** Build an inline diff from parsed Edit/Write args; null for anything else. */

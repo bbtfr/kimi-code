@@ -413,3 +413,39 @@ describe('toolCallDeltaToSessionUpdate live edit diffs', () => {
     expect(update.content).toEqual([{ type: 'diff', path: '/tmp/n.md', oldText: null, newText: '# hi\n' }]);
   });
 });
+
+describe('toolCallDeltaToSessionUpdate title preview', () => {
+  it('previews the growing args tail in the title while the JSON is incomplete', () => {
+    const acc = { args: '' };
+    const update = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't5', name: 'Bash', argumentsPart: '{"command":"npm test -- --wa',
+    } as never, acc).update as any;
+    expect(update.title).toBe('Generating args… {"command":"npm test -- --wa');
+    expect(update.content).toEqual([]);
+    expect(update.rawInput).toBeUndefined();
+  });
+
+  it('trims the preview to the last 40 chars and collapses whitespace', () => {
+    const acc = { args: '' };
+    const update = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't6', name: 'Task',
+      argumentsPart: '{"prompt":"' + 'x'.repeat(60) + '\n\n next',
+    } as never, acc).update as any;
+    expect(update.title.startsWith('Generating args… …')).toBe(true);
+    expect(update.title.length).toBeLessThanOrEqual('Generating args… …'.length + 40);
+    expect(update.title).not.toContain('\n');
+    expect(update.content[0].content.text).toContain('x'.repeat(60));
+  });
+
+  it('drops the preview title once the args parse', () => {
+    const acc = { args: '' };
+    toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't7', name: 'Bash', argumentsPart: '{"command":"ec',
+    } as never, acc);
+    const update = toolCallDeltaToSessionUpdate('s', {
+      agentId: 'a', turnId: 1, toolCallId: 't7', name: 'Bash', argumentsPart: 'ho hi"}',
+    } as never, acc).update as any;
+    expect(update.title).toBeUndefined();
+    expect(update.rawInput).toEqual({ command: 'echo hi' });
+  });
+});
