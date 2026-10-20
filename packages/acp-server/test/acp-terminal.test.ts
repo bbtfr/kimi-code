@@ -91,7 +91,7 @@ describe('AcpSessionRuntime', () => {
   it('mirrors the probed host environment and exposes fs + process capabilities', async () => {
     const runtime = await bindRuntime(makeEnvironment());
 
-    expect([...runtime.capabilities].sort()).toEqual(['fs', 'process']);
+    expect([...runtime.capabilities].toSorted()).toEqual(['fs', 'process']);
     expect(runtime.environment).toMatchObject({
       osKind: 'macOS',
       osArch: 'arm64',
@@ -192,5 +192,36 @@ describe('AcpProcessService local fallback', () => {
     expect(created).toBe(0);
     expect(calls).toHaveLength(1);
     expect(calls[0]).toMatchObject({ command: 'rg', args: ['--files', '--hidden'], options: { cwd: '/repo' } });
+  });
+});
+
+describe('DeferredTerminals', () => {
+  const handle = (id: string, released: string[]) => ({
+    id,
+    release: async () => { released.push(id); },
+  }) as unknown as IAcpTerminalHandle;
+
+  it('releases the oldest terminal on the spot once past the limit', async () => {
+    const { DeferredTerminals } = await import('../src/acp-terminal/acpTerminalRunner');
+    const released: string[] = [];
+    const deferred = new DeferredTerminals(3);
+    for (const id of ['a', 'b', 'c']) deferred.add(handle(id, released));
+    expect(released).toEqual([]);
+    deferred.add(handle('d', released));
+    expect(released).toEqual(['a']);
+    expect(deferred.size).toBe(3);
+    deferred.add(handle('e', released));
+    expect(released).toEqual(['a', 'b']);
+    expect(deferred.size).toBe(3);
+  });
+
+  it('releaseAll releases everything remaining', async () => {
+    const { DeferredTerminals } = await import('../src/acp-terminal/acpTerminalRunner');
+    const released: string[] = [];
+    const deferred = new DeferredTerminals(5);
+    for (const id of ['x', 'y']) deferred.add(handle(id, released));
+    await deferred.releaseAll();
+    expect(new Set(released)).toEqual(new Set(['x', 'y']));
+    expect(deferred.size).toBe(0);
   });
 });

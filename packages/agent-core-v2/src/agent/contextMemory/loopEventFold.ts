@@ -59,6 +59,7 @@ export type LoopRecordedEvent =
       readonly args?: unknown;
       readonly extras?: Record<string, unknown>;
       readonly display?: ToolInputDisplay;
+      readonly description?: string;
       readonly uuid?: string;
       readonly turnId?: string;
       readonly step?: number;
@@ -76,7 +77,7 @@ export type LoopRecordedEvent =
     };
 
 export interface LoopEventFoldSink {
-  openAssistant(time: number | undefined): void;
+  openAssistant(time: number | undefined, stepId?: string): void;
   appendOpenContent(part: ContentPart): void;
   appendOpenToolCall(call: ToolCall, display?: ToolInputDisplay): void;
   dropOpenAssistant(): void;
@@ -158,7 +159,7 @@ function createLoopEventFoldWithState(
       switch (event.type) {
         case 'step.begin': {
           settleOpen(time);
-          sink.openAssistant(time);
+          sink.openAssistant(time, event.uuid);
           openStepUuid = event.uuid;
           openHasToolCalls = false;
           openVacuous = true;

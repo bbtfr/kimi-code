@@ -135,6 +135,27 @@ describe('server-v2 /api/v1/sessions/{sid}/messages', () => {
     }
   }
 
+  it('preserves msg_ IDs for assistant loop messages across server reload', async () => {
+    const id = await createSession();
+    await seedMainAgentMessages(id, []);
+    const session = getLiveSessionById(server!.core.accessor, id)!;
+    const agent = session.accessor.get(IAgentLifecycleService).handleOf('main')!;
+    const context = agent.accessor.get(IAgentContextMemoryService);
+    const uuid = '12345678-1234-4000-8000-123456789abc';
+    context.appendLoopEvent({ type: 'step.begin', uuid });
+    context.appendLoopEvent({ type: 'content.part', stepUuid: uuid, part: { type: 'text', text: 'reply' } });
+    context.appendLoopEvent({ type: 'step.end', uuid });
+    await agent.accessor.get(IWireService).flush();
+    const before = await getJson<PageWire>(`/api/v1/sessions/${id}/messages`);
+    expect(before.body.data.items[0]).toMatchObject({
+      id: `msg_${uuid}`, role: 'assistant', content: [{ type: 'text', text: 'reply' }],
+    });
+    await server!.close();
+    await boot();
+    const after = await getJson<PageWire>(`/api/v1/sessions/${id}/messages`);
+    expect(after.body.data.items).toEqual(before.body.data.items);
+  });
+
   it('returns an empty page when the session has no main agent', async () => {
     const id = await createSession();
     const { body } = await getJson<PageWire>(`/api/v1/sessions/${id}/messages`);

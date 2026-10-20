@@ -1,3 +1,6 @@
+import { createHash } from 'node:crypto';
+import { RequestError } from '@agentclientprotocol/sdk';
+import type { ContextMessage } from '@moonshot-ai/agent-core-v2';
 import { isAbsolute } from 'node:path';
 
 import type {
@@ -33,11 +36,13 @@ import type { AcpStopReason } from './types';
 export function assistantDeltaToSessionUpdate(
   sessionId: string,
   event: AssistantDeltaEvent,
+  messageId?: string,
 ): SessionNotification {
   return {
     sessionId,
     update: {
       sessionUpdate: 'agent_message_chunk',
+      messageId,
       content: { type: 'text', text: event.delta },
     },
   };
@@ -48,10 +53,9 @@ export function assistantDeltaToSessionUpdate(
  *
  * `completed` → `end_turn`: the model finished a clean turn.
  * `cancelled` → `cancelled`: the client/agent cancelled mid-turn.
- * `failed`    → `end_turn` (with the out-of-band `error` logged by the
- *   caller). ACP's `StopReason` has no dedicated `failed` variant in this
- *   protocol version, and the spec discourages signaling errors through
- *   `stopReason` (errors belong on the JSON-RPC error channel).
+ * `failed` throws a JSON-RPC error: `auth_required` for authentication
+ *   failures, `internalError` otherwise. ACP has no failed stop reason;
+ *   callers must reject the prompt request with this error.
  * `failed` + `provider.filtered` → `refusal`: the provider's safety policy
  *   blocked the response.
  * `blocked`   → `refusal`: a prompt hook blocked the turn before the model
@@ -60,7 +64,7 @@ export function assistantDeltaToSessionUpdate(
  */
 export function turnEndReasonToStopReason(
   reason: TurnEndReason,
-  error?: { readonly code: string },
+  error?: { readonly code: string; readonly message?: string },
 ): AcpStopReason {
   switch (reason) {
     case 'completed':
@@ -69,7 +73,11 @@ export function turnEndReasonToStopReason(
       return 'cancelled';
     case 'failed':
       if (error?.code === 'provider.filtered') return 'refusal';
-      return 'end_turn';
+      if (isAuthError(error)) throw RequestError.authRequired(undefined, error?.message);
+      throw RequestError.internalError(
+        { code: error?.code },
+        error?.message ?? 'The agent turn failed.',
+      );
     case 'blocked':
       return 'refusal';
   }
@@ -116,9 +124,10 @@ export function acpToolCallId(turnId: number, toolCallId: string): string {
 export function inferToolKind(name: string): ToolKind {
   switch (name) {
     case 'Read':
+      return 'read';
     case 'Glob':
     case 'Grep':
-      return 'read';
+      return 'search';
     case 'Write':
     case 'Edit':
       return 'edit';
@@ -133,6 +142,16 @@ export function inferToolKind(name: string): ToolKind {
     default:
       return 'other';
   }
+}
+
+/**
+ * Tools with a structured detail view on the client: an args JSON preview
+ * only leaks into the unifiedDiff / output / content slots there (the daemon
+ * maps text content into them), so it is suppressed. Unknown ('other') tools
+ * keep the preview — it is their only visible content.
+ */
+function suppressArgsPreview(name: string | undefined): boolean {
+  return name !== undefined && inferToolKind(name) !== 'other';
 }
 
 /**
@@ -178,6 +197,10 @@ export function toolCallLocations(
   args: unknown,
   display: ToolInputDisplay | undefined,
 ): ToolCallLocation[] | undefined {
+  // Search tools (Grep/Glob): the location is the search root, not a file the
+  // call produces — clients render it as a bare path line that reads as
+  // spilled output. Edit/Write/Read keep theirs (a real file link).
+  if (inferToolKind(name) === 'search') return undefined;
   const displayPath =
     display !== undefined && (display.kind === 'diff' || display.kind === 'file_io')
       ? display.path
@@ -198,20 +221,17 @@ export function toolCallStartToSessionUpdate(
   event: ToolCallStartedEvent,
 ): SessionNotification {
   const title = event.description ?? event.name;
-  const content: ToolCallContent[] = [
-    {
-      type: 'content',
-      content: { type: 'text', text: stringifyArgs(event.args) },
-    },
-  ];
-  // If the tool attached a diff-bearing display, prepend an inline diff entry
-  // so the client can render it alongside the textual args preview.
-  if (event.display) {
-    const diff = displayBlockToAcpContent(event.display);
-    if (diff !== null) {
-      content.unshift(diff);
-    }
-  }
+  // A display block (diff/plan) replaces the textual args preview entirely:
+  // the daemon maps any edit-kind text content to unifiedDiff, where it
+  // overrides the structured diff and renders as raw JSON.
+  const displayContent = event.display ? displayBlockToAcpContent(event.display) : null;
+  const content: ToolCallContent[] = displayContent !== null ? [displayContent]
+    : suppressArgsPreview(event.name) ? [] : [
+      {
+        type: 'content',
+        content: { type: 'text', text: stringifyArgs(event.args) },
+      },
+    ];
   return {
     sessionId,
     update: {
@@ -235,23 +255,59 @@ export function toolCallStartToSessionUpdate(
 export function toolCallDeltaToSessionUpdate(
   sessionId: string,
   event: ToolCallDeltaEvent,
-  accumulator: { args: string },
+  accumulator: { args: string; suppressArgs?: boolean },
 ): SessionNotification {
   accumulator.args += event.argumentsPart ?? '';
+  accumulator.suppressArgs = accumulator.suppressArgs || suppressArgsPreview(event.name);
+  // The preview text stays suppressed for structured kinds, but rawInput is
+  // data, not display: forward it as soon as the args JSON parses so clients
+  // can show the command even before tool.call.started — or after a cancel
+  // that lands mid-stream. Edit/Write additionally get a live diff block so
+  // the original→new comparison renders during streaming.
+  let rawInput: unknown;
+  try { rawInput = JSON.parse(accumulator.args); } catch { rawInput = undefined; }
+  const diff = rawInput !== undefined ? editDiffFromArgs(event.name, rawInput) : null;
+  const content: ToolCallContent[] = diff !== null ? [diff]
+    : accumulator.suppressArgs ? [] : [
+      {
+        type: 'content',
+        content: { type: 'text', text: accumulator.args },
+      },
+    ];
   return {
     sessionId,
     update: {
       sessionUpdate: 'tool_call_update',
       toolCallId: acpToolCallId(event.turnId, event.toolCallId),
       status: 'in_progress',
-      content: [
-        {
-          type: 'content',
-          content: { type: 'text', text: accumulator.args },
-        },
-      ],
+      // Live generation feedback rides the title — the one slot clients never
+      // reinterpret as output/diff. Once args parse, structured data takes over.
+      ...(rawInput === undefined ? { title: argsPreviewTitle(accumulator.args) } : {}),
+      ...(rawInput !== undefined ? { rawInput } : {}),
+      content,
     },
   };
+}
+
+/** Compact tail of the streaming args for the live title preview. */
+function argsPreviewTitle(args: string): string {
+  const compact = args.replaceAll(/\s+/g, ' ').trim();
+  const tail = compact.length > 40 ? `…${compact.slice(-40)}` : compact;
+  return `Generating args… ${tail}`;
+}
+
+/** Build an inline diff from parsed Edit/Write args; null for anything else. */
+function editDiffFromArgs(name: string | undefined, args: unknown): ToolCallContent | null {
+  if (inferToolKind(name ?? '') !== 'edit' || args === null || typeof args !== 'object') return null;
+  const record = args as { path?: unknown; old_string?: unknown; new_string?: unknown; content?: unknown };
+  if (typeof record.path !== 'string') return null;
+  if (typeof record.old_string === 'string' && typeof record.new_string === 'string') {
+    return { type: 'diff', path: record.path, oldText: record.old_string, newText: record.new_string };
+  }
+  if (typeof record.content === 'string') {
+    return { type: 'diff', path: record.path, oldText: null, newText: record.content };
+  }
+  return null;
 }
 
 /**
@@ -277,7 +333,7 @@ export function toolCallLazyCreateToSessionUpdate(
       title: name,
       kind: event.name ? inferToolKind(event.name) : 'other',
       status: 'pending',
-      content: [
+      content: suppressArgsPreview(event.name) ? [] : [
         {
           type: 'content',
           content: { type: 'text', text: event.argumentsPart ?? '' },
@@ -299,18 +355,14 @@ export function toolCallStartedUpgradeToSessionUpdate(
   event: ToolCallStartedEvent,
 ): SessionNotification {
   const title = event.description ?? event.name;
-  const content: ToolCallContent[] = [
-    {
-      type: 'content',
-      content: { type: 'text', text: stringifyArgs(event.args) },
-    },
-  ];
-  if (event.display) {
-    const diff = displayBlockToAcpContent(event.display);
-    if (diff !== null) {
-      content.unshift(diff);
-    }
-  }
+  const displayContent = event.display ? displayBlockToAcpContent(event.display) : null;
+  const content: ToolCallContent[] = displayContent !== null ? [displayContent]
+    : suppressArgsPreview(event.name) ? [] : [
+      {
+        type: 'content',
+        content: { type: 'text', text: stringifyArgs(event.args) },
+      },
+    ];
   return {
     sessionId,
     update: {
@@ -354,11 +406,13 @@ export function toolProgressToSessionUpdate(
 export function thinkingDeltaToSessionUpdate(
   sessionId: string,
   event: ThinkingDeltaEvent,
+  messageId?: string,
 ): SessionNotification {
   return {
     sessionId,
     update: {
       sessionUpdate: 'agent_thought_chunk',
+      messageId,
       content: { type: 'text', text: event.delta },
     },
   };
@@ -376,6 +430,8 @@ export function toolResultToSessionUpdate(
   sessionId: string,
   event: ToolResultEvent,
   locations?: ToolCallLocation[],
+  display?: ToolInputDisplay,
+  title?: string,
 ): SessionNotification {
   return {
     sessionId,
@@ -383,7 +439,8 @@ export function toolResultToSessionUpdate(
       sessionUpdate: 'tool_call_update',
       toolCallId: acpToolCallId(event.turnId, event.toolCallId),
       status: event.isError ? 'failed' : 'completed',
-      content: toolResultToAcpContent(event),
+      title,
+      content: withToolDisplay(toolResultToAcpContent(event), display, event.isError),
       rawOutput: event.output,
       locations,
     },
@@ -392,16 +449,15 @@ export function toolResultToSessionUpdate(
 
 /**
  * Translate a TodoList display block into an ACP `plan` session update.
- * `done` rewrites to `completed`; `priority` defaults to `'medium'`. Returns
- * `null` for an empty items array.
+ * `done` rewrites to `completed`; `priority` defaults to `'medium'`. Empty
+ * entries clear the client's previous plan.
  */
 export function todoListToSessionUpdate(
   sessionId: string,
   turnId: number,
   items: ReadonlyArray<{ title: string; status: string }>,
-): SessionNotification | null {
+): SessionNotification {
   void turnId;
-  if (items.length === 0) return null;
   const entries: PlanEntry[] = items.map((item) => ({
     content: item.title,
     priority: 'medium',
@@ -534,4 +590,104 @@ export function sessionInfoUpdateNotification(
       title,
     },
   };
+}
+
+/** ACP replaces content on update; preserve the tool's display through completion. */
+export function withToolDisplay(
+  content: ToolCallContent[],
+  display?: ToolInputDisplay,
+  isError?: boolean,
+): ToolCallContent[] {
+  const block = display === undefined ? null : displayBlockToAcpContent(display);
+  // A successful call with a structured diff carries the diff only: the
+  // textual output duplicates it (rawOutput preserves the full result), and
+  // some clients render text content in place of the diff. Failures keep
+  // their error text.
+  if (block !== null && isError !== true) return [block];
+  return block === null ? content : [block, ...content];
+}
+
+/** Both observed context messages and replayed messages cross this boundary. */
+export function contextMessageToSessionUpdates(
+  sessionId: string,
+  message: ContextMessage,
+  fallbackId: string,
+): SessionNotification[] {
+  if (message.role !== 'user' && message.role !== 'system') return [];
+  const origin = message.origin;
+  if (message.role === 'system' && origin === undefined) return [];
+  const text = message.content.filter(p => p.type === 'text').map(p => p.text).join('');
+  if (!text) return [];
+  return [{
+    sessionId,
+    update: {
+      sessionUpdate: 'user_message_chunk',
+      messageId: message.id ?? fallbackId,
+      content: { type: 'text', text: formatContextNotification(text, origin) },
+      _meta: { origin },
+    },
+  }];
+}
+
+/** Keep established envelopes intact; wrap only otherwise unmarked context. */
+export function formatContextNotification(text: string, origin: ContextMessage['origin']): string {
+  if (origin?.kind === 'shell_command') return text;
+  if (origin === undefined || origin.kind === 'user') return text;
+  const trimmed = text.trim();
+  const envelope = /^<([a-z][a-z0-9-]*)(?:\s[^<>]*)?>[\s\S]*<\/\1>$/i;
+  if (envelope.test(trimmed)) return text;
+  if (/<skill-loaded(?:\s[^<>]*)?>[\s\S]*<\/skill-loaded>/.test(text)) return text;
+  let category: string;
+  let type: string;
+  let title: string;
+  switch (origin.kind) {
+    case 'task':
+      category = 'task'; type = `task.${origin.status}`; title = `Background task ${origin.status}`; break;
+    case 'cron_job':
+      category = 'cron'; type = 'cron.fired'; title = 'Scheduled task'; break;
+    case 'cron_missed':
+      category = 'cron'; type = 'cron.missed'; title = 'Missed scheduled tasks'; break;
+    case 'system_trigger':
+      category = origin.name.startsWith('goal_') ? 'goal' : 'system';
+      type = category === 'goal' ? `goal.${origin.name.slice('goal_'.length)}` : `system.${origin.name}`;
+      title = origin.name === 'goal_continuation' ? 'Continue active goal' : origin.name; break;
+    case 'injection':
+      category = 'context'; type = `context.${origin.variant}`; title = origin.variant; break;
+    case 'compaction_summary':
+      category = 'context'; type = 'context.compaction'; title = 'Conversation summary'; break;
+    case 'hook_result':
+      category = 'hook'; type = `hook.${origin.event}`; title = origin.event; break;
+    case 'skill_activation':
+      category = 'skill'; type = 'skill.activation'; title = origin.skillName; break;
+    case 'plugin_command':
+      category = 'command'; type = 'command.activation'; title = `${origin.pluginId}:${origin.commandName}`; break;
+    case 'retry':
+      category = 'system'; type = 'system.retry'; title = 'Retry'; break;
+    default:
+      return text;
+  }
+  return `<notification category="${escapeNotificationXml(category)}" type="${escapeNotificationXml(type)}">\nTitle: ${escapeNotificationXml(title)}\n\n${escapeNotificationXml(text)}\n</notification>`;
+}
+
+function escapeNotificationXml(text: string): string {
+  return text.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;')
+    .replaceAll('"', '&quot;').replaceAll("'", '&apos;');
+}
+
+export function legacyMessageId(message: ContextMessage, position: number): string {
+  return `context:${position}:${createHash('sha256').update(JSON.stringify(message)).digest('hex').slice(0, 16)}`;
+}
+
+/** One terminal tool projection, shared by live delivery and journal replay. */
+export function completedToolToSessionUpdate(
+  sessionId: string,
+  event: ToolResultEvent,
+  call?: ToolCallStartedEvent,
+): SessionNotification {
+  return toolResultToSessionUpdate(
+    sessionId, event,
+    call === undefined ? undefined : toolCallLocations(call.name, call.args, call.display),
+    call?.display,
+    call === undefined ? undefined : call.description ?? call.name,
+  );
 }

@@ -18,6 +18,7 @@ export const FAKE_MODEL_ID = 'fake';
 export const FAKE_MODEL_ALT_ID = 'fake-alt';
 
 export interface FakeModelConfigOptions {
+  readonly imageIn?: boolean;
   /**
    * Declare the 'thinking' capability on FAKE_MODEL_ID so the ACP host
    * advertises the thinking toggle for it.
@@ -34,7 +35,7 @@ export interface FakeModelConfigOptions {
 }
 
 const configToml = (options?: FakeModelConfigOptions): string => {
-  const thinking = options?.thinking === true;
+  const capabilities = [options?.thinking === true ? 'thinking' : undefined, options?.imageIn === true ? 'image_in' : undefined].filter((value): value is string => value !== undefined);
   const efforts = options?.supportEfforts;
   const defaultEffort = options?.defaultEffort;
   const altThinking = options?.altThinking === true;
@@ -48,7 +49,7 @@ protocol = "openai"
 baseUrl = "http://localhost"
 apiKey = "test-token"
 maxContextSize = 8192
-${thinking ? 'capabilities = ["thinking"]\n' : ''}${efforts !== undefined ? `supportEfforts = [${efforts.map((e) => `"${e}"`).join(', ')}]\n` : ''}${defaultEffort !== undefined ? `defaultEffort = "${defaultEffort}"\n` : ''}[models.${FAKE_MODEL_ALT_ID}]
+${capabilities.length > 0 ? `capabilities = ${JSON.stringify(capabilities)}\n` : ''}${efforts !== undefined ? `supportEfforts = [${efforts.map((e) => `"${e}"`).join(', ')}]\n` : ''}${defaultEffort !== undefined ? `defaultEffort = "${defaultEffort}"\n` : ''}[models.${FAKE_MODEL_ALT_ID}]
 name = "fake-model-alt"
 protocol = "openai"
 baseUrl = "http://localhost"

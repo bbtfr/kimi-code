@@ -101,6 +101,7 @@ export type MachineEngineEvent =
       readonly name: string;
       readonly args: unknown;
       readonly display?: ToolInputDisplay;
+      readonly description?: string;
     }
   | { readonly type: 'toolUpdate'; readonly toolCallId: string; readonly update: ToolUpdate }
   | { readonly type: 'toolAsync'; readonly toolCallId: string; readonly text: string }
@@ -303,6 +304,7 @@ export function machineEngineAttachBundle(options: CreateMachineEngineOptions): 
         name: payload.name,
         args: payload.args,
         display: payload.display,
+        description: payload.description,
       });
     },
     onToolResult: options.onToolResult,

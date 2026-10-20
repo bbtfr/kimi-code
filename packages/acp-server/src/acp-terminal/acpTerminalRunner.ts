@@ -22,7 +22,39 @@ import { AcpHostFileSystem, IAcpConnection, type IAcpTerminalHandle } from '../a
 
 const OUTPUT_BYTE_LIMIT = 4 * 1024 * 1024;
 const OUTPUT_POLL_MS = 250;
+const DEFERRED_TERMINAL_LIMIT = 100;
 let nextGeneration = 1;
+
+/**
+ * Bounded deferral set for session terminals. Terminals stay on the client so
+ * completed Bash output remains visible in the client's timeline; once more
+ * than `limit` accumulate, the oldest is released on the spot so long-lived
+ * sessions stay memory-bounded.
+ */
+export class DeferredTerminals {
+  private readonly handles = new Set<IAcpTerminalHandle>();
+
+  constructor(private readonly limit: number) {}
+
+  add(handle: IAcpTerminalHandle): void {
+    this.handles.add(handle);
+    if (this.handles.size > this.limit) {
+      const oldest = this.handles.values().next().value as IAcpTerminalHandle;
+      this.handles.delete(oldest);
+      void oldest.release().catch(() => {});
+    }
+  }
+
+  get size(): number {
+    return this.handles.size;
+  }
+
+  async releaseAll(): Promise<void> {
+    const all = [...this.handles];
+    this.handles.clear();
+    await Promise.allSettled(all.map((handle) => handle.release()));
+  }
+}
 
 function isBashToolInvocation(args: readonly string[], options?: HostProcessOptions): boolean {
   return (
@@ -42,6 +74,7 @@ function envRecordToAcp(
 
 class AcpProcessService implements IHostProcessService {
   declare readonly _serviceBrand: undefined;
+  private readonly deferredTerminals = new DeferredTerminals(DEFERRED_TERMINAL_LIMIT);
 
   constructor(
     private readonly sessionId: string,
@@ -67,12 +100,22 @@ class AcpProcessService implements IHostProcessService {
       cwd: options?.cwd ?? this.cwd,
       outputByteLimit: OUTPUT_BYTE_LIMIT,
     });
+    // Terminals outlive their process: the client keeps the entry (and its
+    // output) for its timeline until the session ends — releasing at process
+    // dispose would erase the completed call's output from the client's UI.
+    // DeferredTerminals bounds the deferral (oldest released past the cap).
+    this.deferredTerminals.add(handle);
     this.connection.notifyTerminalCreated({
       sessionId: this.sessionId,
       shellCommand: args[1] ?? '',
       terminalId: handle.id,
     });
     return new AcpTerminalProcess(handle);
+  }
+
+  /** Release every terminal this session created; called on session close. */
+  async releaseTerminals(): Promise<void> {
+    return this.deferredTerminals.releaseAll();
   }
 }
 
@@ -124,10 +167,9 @@ class AcpTerminalProcess implements IHostProcess {
     if (this.released) return;
     this.released = true;
     this.stopPolling();
-    try {
-      await this.handle.release();
-    } catch {
-    }
+    // No terminal/release here: the terminal stays on the client so its
+    // output remains visible; AcpProcessService.releaseTerminals (on session
+    // close) performs the release.
   }
 
   private async run(): Promise<number> {
@@ -207,7 +249,9 @@ class AcpSessionRuntime implements Runtime {
     this.process = new AcpProcessService(sessionId, cwd, connection, local);
   }
 
-  dispose(): void {}
+  dispose(): void {
+    void (this.process as AcpProcessService).releaseTerminals().catch(() => {});
+  }
 }
 
 class AcpWorkspaceRuntimeAttachment implements RuntimeProviderAttachment {
@@ -241,7 +285,7 @@ class AcpWorkspaceRuntimeAttachment implements RuntimeProviderAttachment {
   async dispose(): Promise<void> {
     const registrations = [...this.sessions.values()];
     this.sessions.clear();
-    for (const registration of registrations.reverse()) await registration.remove();
+    for (const registration of registrations.toReversed()) await registration.remove();
   }
 }
 
