@@ -42,6 +42,7 @@ function envRecordToAcp(
 
 class AcpProcessService implements IHostProcessService {
   declare readonly _serviceBrand: undefined;
+  private readonly terminalHandles = new Set<IAcpTerminalHandle>();
 
   constructor(
     private readonly sessionId: string,
@@ -67,12 +68,23 @@ class AcpProcessService implements IHostProcessService {
       cwd: options?.cwd ?? this.cwd,
       outputByteLimit: OUTPUT_BYTE_LIMIT,
     });
+    // Terminals outlive their process: the client keeps the entry (and its
+    // output) for its timeline until the session ends — releasing at process
+    // dispose would erase the completed call's output from the client's UI.
+    this.terminalHandles.add(handle);
     this.connection.notifyTerminalCreated({
       sessionId: this.sessionId,
       shellCommand: args[1] ?? '',
       terminalId: handle.id,
     });
     return new AcpTerminalProcess(handle);
+  }
+
+  /** Release every terminal this session created; called on session close. */
+  async releaseTerminals(): Promise<void> {
+    const handles = [...this.terminalHandles];
+    this.terminalHandles.clear();
+    await Promise.allSettled(handles.map((handle) => handle.release()));
   }
 }
 
@@ -124,10 +136,9 @@ class AcpTerminalProcess implements IHostProcess {
     if (this.released) return;
     this.released = true;
     this.stopPolling();
-    try {
-      await this.handle.release();
-    } catch {
-    }
+    // No terminal/release here: the terminal stays on the client so its
+    // output remains visible; AcpProcessService.releaseTerminals (on session
+    // close) performs the release.
   }
 
   private async run(): Promise<number> {
@@ -207,7 +218,9 @@ class AcpSessionRuntime implements Runtime {
     this.process = new AcpProcessService(sessionId, cwd, connection, local);
   }
 
-  dispose(): void {}
+  dispose(): void {
+    void (this.process as AcpProcessService).releaseTerminals().catch(() => {});
+  }
 }
 
 class AcpWorkspaceRuntimeAttachment implements RuntimeProviderAttachment {
@@ -241,7 +254,7 @@ class AcpWorkspaceRuntimeAttachment implements RuntimeProviderAttachment {
   async dispose(): Promise<void> {
     const registrations = [...this.sessions.values()];
     this.sessions.clear();
-    for (const registration of registrations.reverse()) await registration.remove();
+    for (const registration of registrations.toReversed()) await registration.remove();
   }
 }
 

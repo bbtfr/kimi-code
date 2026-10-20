@@ -1470,9 +1470,10 @@ describe('acp-server terminal reverse-RPC (clientCapabilities.terminal)', () => 
     expect(t.createParams.cwd).toBe(homeDir);
     expect(t.createParams.env).toContainEqual({ name: 'TERM', value: 'dumb' });
 
-    // Normal-exit lifecycle: wait_for_exit resolved, the terminal was
-    // released exactly once (via IProcess.dispose), never killed.
-    expect(t.released).toBe(true);
+    // Normal-exit lifecycle: wait_for_exit resolved; the terminal is NOT
+    // released at process dispose — release defers to session close so the
+    // client keeps the output for its timeline.
+    expect(t.released).toBe(false);
     expect(t.killed).toBe(false);
 
     // The tool card carries the terminal embed — not a textual copy of the
@@ -1487,6 +1488,10 @@ describe('acp-server terminal reverse-RPC (clientCapabilities.terminal)', () => 
     // result fed back on the second generate() call.
     const secondCall = scripted!.callHistory()[1];
     expect(JSON.stringify(secondCall)).toContain('hello_from_terminal');
+
+    // Session close releases the deferred terminal exactly once.
+    await c.close();
+    expect(t.released).toBe(true);
   }, 30_000);
 
   it('falls back to local execution when the client does not advertise the capability', async () => {
