@@ -8,10 +8,10 @@
  * `prompt` submits the user input via `agent.prompt(...)` and translates the
  * agent's scoped event stream — subscribed once per session in `init()`,
  * before the first prompt — into ACP `session/update` notifications via the
- * helpers in `./events-map`. The promise settles on the `turn.ended` event; a
- * submission that launches no turn (busy / hook-blocked / not runnable)
- * settles gracefully with `end_turn`, mirroring the engine's `PromptHandle`
- * behavior.
+ * helpers in `./events-map`. The promise settles on the `turn.ended` event.
+ * Queued submissions stay pending until their real turn settles; only a
+ * submission that cannot launch (hook-blocked / not runnable) settles early
+ * with `end_turn`, mirroring the engine's `PromptHandle` behavior.
  *
  * KLIENT GAPS (all reported; each marked `KLIENT-GAP` inline):
  *  - no session MCP connection view / compaction service → the `/mcp` and
@@ -154,12 +154,15 @@ interface ResolvedCommands {
 interface TurnDriver {
   resolve(response: PromptResponse): void;
   reject(error: unknown): void;
+  /** Client-side identity supplied to `agent.prompt`, used to recognize a
+   * queued prompt when its real `turn.started` eventually arrives. */
+  promptId?: string;
   /**
-   * Learned once the launch call (`agent.prompt` / `agent.activateSkill`)
-   * resolves. Events carry a `turnId`, but until this is set no turn-scoped
-   * event can be attributed to this prompt — and the turn may START (with a
-   * fast model even END) before the launch round-trip delivers the id. Such
-   * events are buffered in {@link early} instead of being dropped.
+   * Learned from the launch result or from `turn.started` for a queued
+   * prompt. Until this is set no turn-scoped event can be attributed to this
+   * prompt — and the turn may START (with a fast model even END) before the
+   * launch round-trip delivers the id. Such events are buffered in
+   * {@link early} instead of being dropped.
    */
   turnId?: number;
   settled: boolean;
@@ -169,9 +172,11 @@ interface TurnDriver {
    * and a no-launch outcome settles `cancelled` instead of `end_turn`.
    */
   cancelRequested?: boolean;
+  /** Set once the queued prompt is actually removed from the engine queue. */
+  queueCancelCompleted?: boolean;
   /**
    * Turn-scoped events that arrived while `turnId` was still unknown. Once
-   * the launch resolves, all entries are forwarded in arrival order; only
+   * the turn id is bound, all entries are forwarded in arrival order; only
    * the matching turn may settle the prompt.
    */
   early: Array<{ readonly turnId: number; readonly dispatch: () => void }>;
@@ -198,6 +203,7 @@ export class AcpSession {
   /** The in-flight prompt's driver, if any. */
   private driver: TurnDriver | undefined;
   private activeTurnId: number | undefined;
+  private activeTurnPromptId: string | undefined;
   private readonly toolCalls = new Map<string, ToolCallStartedEvent>();
   private stepId: string | undefined;
   /**
@@ -307,7 +313,12 @@ export class AcpSession {
       }),
       events.on('turn.started', (event) => {
         this.activeTurnId = event.turnId;
+        this.activeTurnPromptId = event.promptId;
         this.stepId = undefined;
+        const driver = this.driver;
+        if (driver?.promptId !== undefined && driver.promptId === event.promptId) {
+          this.bindDriverTurn(driver, event.turnId);
+        }
       }),
       events.on('assistant.delta', (event) => {
         this.dispatchTurnEvent(event.turnId, () => {
@@ -340,9 +351,32 @@ export class AcpSession {
         });
       }),
       events.on('turn.ended', (event) => {
-        if (this.activeTurnId === event.turnId) this.activeTurnId = undefined;
         this.dispatchTurnEvent(event.turnId, () => {
           this.onTurnEnded(event);
+        });
+        if (this.activeTurnId === event.turnId) {
+          this.activeTurnId = undefined;
+          this.activeTurnPromptId = undefined;
+        }
+      }),
+      events.on('prompt.completed', (event) => {
+        const driver = this.driver;
+        if (driver === undefined || driver.promptId !== event.promptId) return;
+        if (event.reason === 'blocked') {
+          this.settleDriver(driver, () => {
+            driver.resolve({ stopReason: driver.cancelRequested === true ? 'cancelled' : 'end_turn' });
+          });
+        } else if (event.reason === 'failed') {
+          this.settleDriver(driver, () => {
+            driver.reject(mapPromptLaunchError(new Error('Prompt failed'), this.sessionId));
+          });
+        }
+      }),
+      events.on('prompt.aborted', (event) => {
+        const driver = this.driver;
+        if (driver === undefined || driver.promptId !== event.promptId) return;
+        this.settleDriver(driver, () => {
+          driver.resolve({ stopReason: 'cancelled' });
         });
       }),
       // Compaction runs as a background LLM task outside any turn, so these
@@ -709,14 +743,9 @@ export class AcpSession {
   }
 
   /**
-   * Reject a second model-bound prompt while a turn is in flight. The engine
-   * QUEUES a plain `agent.prompt` submitted during an active turn (the launch
-   * resolves `undefined`, indistinguishable from a hook-blocked launch), and
-   * tracking that queued turn would overwrite the only in-flight driver — the
-   * first prompt would never settle and both turns' events would go
-   * unattributed. The legacy adapter rejected this case (`turn.agent_busy` →
-   * -32600); reject locally instead, synchronously with driver assignment so
-   * two concurrent prompts cannot race past the check.
+   * Reject skill activation or a second prompt while a prompt driver is
+   * unsettled. A plain prompt submitted while only an autonomous turn is
+   * active instead uses the engine queue, so this guard is not called for it.
    */
   private assertNoActiveTurn(): void {
     if (this.activeTurnId !== undefined || (this.driver !== undefined && !this.driver.settled)) {
@@ -728,58 +757,43 @@ export class AcpSession {
   }
 
   /**
-   * Submit the prompt and drive the turn to completion: `agent.prompt()`
-   * returns the launched turn id, which the session-level event handlers use
-   * to attribute events to this driver. Settles on `turn.ended`; a no-launch
-   * result (hook-blocked / not runnable) settles with `end_turn`.
+   * Submit a plain prompt and let the engine queue it behind any autonomous
+   * turn. Only a second unsettled ACP prompt is rejected: that would replace
+   * the single in-flight driver and lose the first prompt's settlement.
    */
   private driveTurn(input: readonly ContentPart[]): Promise<PromptResponse> {
-    this.assertNoActiveTurn();
-    return this.driveLaunch(this.agent.prompt({ input }));
+    if (this.driver !== undefined && !this.driver.settled) this.assertNoActiveTurn();
+    const promptId = randomUUID();
+    return this.driveLaunch(this.agent.prompt({ input, promptId }), promptId);
   }
 
   /**
    * Shared turn settlement for every launch path (`agent.prompt`,
-   * `agent.activateSkill`): the returned turn id attributes subsequent events
-   * to this driver; `undefined` means no turn launched (hook-blocked / not
-   * runnable — the busy case never gets this far, see
-   * {@link assertNoActiveTurn}), so the prompt settles gracefully with
-   * `end_turn`.
+   * `agent.activateSkill`). An immediate turn id binds the driver directly;
+   * `undefined` for a plain prompt means queued, so it stays pending until
+   * `turn.started`, `prompt.aborted`, or `prompt.completed(blocked)` arrives.
+   * Only the skill path has no promptId and keeps the old early settlement.
    */
-  private driveLaunch(launch: Promise<PromptLaunchResult>): Promise<PromptResponse> {
+  private driveLaunch(launch: Promise<PromptLaunchResult>, promptId?: string): Promise<PromptResponse> {
     return new Promise<PromptResponse>((resolve, reject) => {
-      const driver: TurnDriver = { resolve, reject, settled: false, early: [] };
+      const driver: TurnDriver = { resolve, reject, settled: false, promptId, early: [] };
       this.driver = driver;
       launch.then(
         (launched) => {
-          if (driver.settled) return;
-          if (launched === undefined) {
-            // No turn will emit `turn.ended`, so settle gracefully. The engine
-            // publishes a `prompt.completed` with reason 'blocked' for the
-            // hook-blocked case; the wire carries no blocking message to
-            // surface, matching the old `PromptHandle`-based behavior.
-            this.settleDriver(driver, () => {
-              resolve({ stopReason: driver.cancelRequested === true ? 'cancelled' : 'end_turn' });
-            });
+          if (driver.settled) {
+            if (driver.cancelRequested === true) this.cancelQueuedPrompt(driver);
             return;
           }
-          driver.turnId = launched.turn_id;
-          if (driver.cancelRequested === true) {
-            // A cancel arrived before the id was known (see `cancel()`): the
-            // unaddressed cancel may have predated the turn's activation, so
-            // re-issue it now precisely addressed. Idempotent.
-            void this.agent.cancel({ turnId: launched.turn_id }).catch((error) => {
-              log.warn('acp: deferred cancel failed', {
-                sessionId: this.sessionId,
-                error: error instanceof Error ? error.message : String(error),
+          if (launched === undefined) {
+            if (driver.cancelRequested === true) this.cancelQueuedPrompt(driver);
+            if (driver.promptId === undefined) {
+              this.settleDriver(driver, () => {
+                resolve({ stopReason: driver.cancelRequested === true ? 'cancelled' : 'end_turn' });
               });
-            });
+            }
+            return;
           }
-          // Attribution is ready; forward all buffered session events, including
-          // autonomous turns, without allowing them to settle this prompt.
-          for (const early of driver.early.splice(0)) {
-            early.dispatch();
-          }
+          this.bindDriverTurn(driver, launched.turn_id);
         },
         (error) => {
           this.settleDriver(driver, () => {
@@ -790,13 +804,51 @@ export class AcpSession {
     });
   }
 
+  private cancelQueuedPrompt(driver: TurnDriver): void {
+    if (driver.promptId === undefined || driver.queueCancelCompleted === true) return;
+    void this.agent.cancelPrompt({ promptId: driver.promptId })
+      .then(() => {
+        driver.queueCancelCompleted = true;
+      })
+      .catch((error) => {
+        if ((error as { code?: unknown } | null)?.code === 'prompt.not_found') return;
+        log.warn('acp: queued prompt cancel failed', {
+          sessionId: this.sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+  }
+
+  private bindDriverTurn(driver: TurnDriver, turnId: number): void {
+    if (driver.settled || driver.turnId !== undefined) return;
+    driver.turnId = turnId;
+    if (driver.cancelRequested === true) {
+      // The unaddressed cancel may have predated the turn's activation, so
+      // re-issue it now precisely addressed. Idempotent.
+      void this.agent.cancel({ turnId }).catch((error) => {
+        log.warn('acp: deferred cancel failed', {
+          sessionId: this.sessionId,
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+    }
+    // Forward buffered session events without letting them settle the prompt.
+    for (const early of driver.early.splice(0)) early.dispatch();
+  }
+
   /**
-   * Route a turn-scoped event: buffer it while the in-flight prompt's turn id
-   * is still unknown (see {@link TurnDriver.early}), otherwise dispatch live.
+   * Buffer only events that cannot be attributed yet. The active turn's output
+   * keeps flowing while a prompt waits in the queue; it is not early data for
+   * the queued prompt and must not accumulate for minutes.
    */
   private dispatchTurnEvent(turnId: number, dispatch: () => void): void {
     const driver = this.driver;
-    if (driver !== undefined && !driver.settled && driver.turnId === undefined) {
+    if (
+      driver !== undefined &&
+      !driver.settled &&
+      driver.turnId === undefined &&
+      (driver.promptId === undefined || driver.promptId === this.activeTurnPromptId)
+    ) {
       driver.early.push({ turnId, dispatch });
       return;
     }
@@ -1150,20 +1202,26 @@ export class AcpSession {
     }
     const turnId = driver.turnId;
     if (turnId === undefined) {
-      // The launch round-trip has not returned the turn id yet. The engine's
-      // cancel payload makes turnId optional — an empty call cancels whatever
-      // turn is active (the same contract kap-server's cancel route relies
-      // on) — and concurrent prompts are rejected, so the active turn can only
-      // be this driver's. Flag the driver too: when the id lands, the launch
-      // handler re-issues a precisely-addressed cancel, and a no-launch
-      // outcome settles `cancelled` instead of `end_turn`.
+      // Remove the queued prompt immediately so it cannot run after this ACP
+      // session is disposed. Also cancel the autonomous turn it was waiting
+      // behind. cancelRequested remains the launch-round-trip backstop for
+      // prompt registration and hook-blocked outcomes.
       driver.cancelRequested = true;
-      void this.agent.cancel().catch((error) => {
-        log.warn('acp: cancel (unaddressed) failed', {
-          sessionId: this.sessionId,
-          error: error instanceof Error ? error.message : String(error),
+      this.cancelQueuedPrompt(driver);
+      if (this.activeTurnId !== undefined) {
+        void this.agent.cancel({ turnId: this.activeTurnId }).catch((error) => {
+          log.warn('acp: background cancel failed', { sessionId: this.sessionId, error });
         });
-      });
+      } else {
+        // The active turn may be unobserved (cold resume / mid-turn attach):
+        // an unaddressed cancel is the only remaining way to stop it.
+        void this.agent.cancel().catch((error) => {
+          log.warn('acp: cancel (unaddressed) failed', {
+            sessionId: this.sessionId,
+            error: error instanceof Error ? error.message : String(error),
+          });
+        });
+      }
       return;
     }
     void this.agent.cancel({ turnId }).catch((error) => {

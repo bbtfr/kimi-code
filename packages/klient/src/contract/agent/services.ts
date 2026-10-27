@@ -49,6 +49,7 @@ export const agentSkillContract = {
 
 export const agentLoopContract = {
   cancelFromUser: { input: z.tuple([z.number().optional()]), output: noResult },
+  cancelPrompt: { input: z.tuple([z.string().min(1)]), output: noResult },
 } satisfies ServiceContract;
 
 export const agentPermissionModeContract = {

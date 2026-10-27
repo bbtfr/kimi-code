@@ -69,6 +69,7 @@ export interface AgentFacade {
    */
   activateSkill(input: { name: string; args?: string }): Promise<PromptLaunchResult>;
   cancel(input?: { turnId?: number }): Promise<void>;
+  cancelPrompt(input: { promptId: string }): Promise<void>;
   runShellCommand(input: { command: string; commandId?: string }): Promise<ShellCommandResult>;
   cancelShellCommand(input: { commandId: string }): Promise<void>;
   getModel(): Promise<string>;
@@ -117,6 +118,8 @@ export function createAgentFacade(call: ScopedCaller, scope: ScopeRef): AgentFac
       // No turnId sends an empty arg list: `[undefined]` would cross the wire
       // as `[null]`, and `cancelFromUser(null)` would not match the active turn.
       call(scope, 'agentLoopService', 'cancelFromUser', input?.turnId === undefined ? [] : [input.turnId]) as Promise<void>,
+    cancelPrompt: (input) =>
+      call(scope, 'agentLoopService', 'cancelPrompt', [input.promptId]) as Promise<void>,
     runShellCommand: (input) =>
       call(scope, 'agentShellCommandService', 'run', [input]) as Promise<ShellCommandResult>,
     cancelShellCommand: (input) =>

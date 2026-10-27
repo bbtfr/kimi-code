@@ -20,7 +20,7 @@ import { ToolProgress } from '@moonshot-ai/agent-core-v2/agent/toolExecutor/tool
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { turnEndReasonToStopReason } from '../src/events-map';
-import { mapPromptLaunchError } from '../src/session';
+import { AcpSession, mapPromptLaunchError } from '../src/session';
 import { createTestClient, type TestClient } from './_helpers/acpClient';
 import { writeFakeModelConfig } from './_helpers/fakeModelConfig';
 import { solidPngBase64 } from './_helpers/png';
@@ -514,7 +514,106 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
     expect(settledTranscript(client.sessionUpdates().map(m => (m.params as SessionNotification).update))).toEqual(settledTranscript(updates));
   }, 30_000);
 
-  it('can cancel an autonomous task turn and rejects a competing ACP prompt', async () => {
+  it('queues a prompt behind an autonomous task turn and settles it after that turn', async () => {
+    const c = await boot();
+    scripted!.mockNextResponse({
+      type: 'function', id: 'task_bash', name: 'Bash', arguments: JSON.stringify({ command: 'echo background_gate' }),
+    });
+    scripted!.mockNextText('background done');
+    scripted!.mockNextText('queued answer');
+    let releasePermission: (() => void) | undefined;
+    const permissionSeen = new Promise<void>((seen) => {
+      c.onRequest('session/request_permission', () => {
+        seen();
+        return new Promise((resolve) => {
+          releasePermission = () => resolve({ outcome: { outcome: 'selected', optionId: 'approve_once' } });
+        });
+      });
+    });
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const session = getLiveSessionById(c.server.core.accessor, created.sessionId)!;
+    const agent = session.accessor.get(IAgentLifecycleService).handleOf('main')!;
+    const loop = agent.accessor.get(IAgentLoopService);
+    const origin = { kind: 'task', taskId: 'task-example', status: 'completed', notificationId: 'notification-example' };
+    loop.submit({
+      message: { role: 'user', content: [{ type: 'text', text: 'continue after task completion' }] },
+      meta: { origin },
+    });
+    await permissionSeen;
+    const queuedPrompt = c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'queued user prompt' }],
+    });
+    const early = await Promise.race([
+      queuedPrompt.then(() => 'settled'),
+      new Promise<string>((resolve) => setTimeout(() => resolve('pending'), 50)),
+    ]);
+    expect(early).toBe('pending');
+    releasePermission!();
+    await expect(queuedPrompt).resolves.toMatchObject({ stopReason: 'end_turn' });
+    await loop.settled();
+    expect(scripted!.callCount()).toBe(3);
+    expect(c.received.filter((message) => message.error !== undefined)).toEqual([]);
+  }, 30_000);
+
+  it('dispatches autonomous turn events live while a prompt is queued', () => {
+    const session = Object.create(AcpSession.prototype) as AcpSession;
+    const driver = {
+      promptId: 'queued' as string | undefined,
+      turnId: undefined as number | undefined,
+      settled: false,
+      early: [] as Array<() => void>,
+    };
+    const state = session as unknown as {
+      driver: typeof driver;
+      activeTurnPromptId: string;
+      dispatchTurnEvent(turnId: number, dispatch: () => void): void;
+    };
+    state.driver = driver;
+    state.activeTurnPromptId = 'autonomous';
+    let live = 0;
+    state.dispatchTurnEvent(1, () => { live++; });
+    expect(live).toBe(1);
+    expect(driver.early).toEqual([]);
+
+    state.activeTurnPromptId = 'queued';
+    state.dispatchTurnEvent(2, () => { live++; });
+    expect(live).toBe(1);
+    expect(driver.early).toHaveLength(1);
+
+    driver.promptId = undefined;
+    state.activeTurnPromptId = 'autonomous';
+    state.dispatchTurnEvent(3, () => { live++; });
+    expect(driver.early).toHaveLength(2);
+  });
+
+  it('cancels an unobserved active turn together with the queued prompt', () => {
+    const session = Object.create(AcpSession.prototype) as AcpSession;
+    const cancelPromptIds: string[] = [];
+    const unaddressedCancels: unknown[] = [];
+    const state = session as unknown as {
+      driver: { promptId: string; turnId?: number; settled: boolean; early: unknown[]; cancelRequested?: boolean };
+      activeTurnId?: number;
+      pendingPromptAborts: Set<{ aborted: boolean }>;
+      agent: {
+        cancelPrompt(input: { promptId: string }): Promise<void>;
+        cancel(input?: { turnId?: number }): Promise<void>;
+      };
+      cancel(): void;
+    };
+    state.driver = { promptId: 'queued', turnId: undefined, settled: false, early: [] };
+    state.activeTurnId = undefined;
+    state.pendingPromptAborts = new Set();
+    state.agent = {
+      cancelPrompt: async ({ promptId }) => { cancelPromptIds.push(promptId); },
+      cancel: async (input) => { unaddressedCancels.push(input); },
+    };
+    state.cancel();
+    expect(cancelPromptIds).toEqual(['queued']);
+    expect(unaddressedCancels).toEqual([undefined]);
+    expect(state.driver.cancelRequested).toBe(true);
+  });
+
+  it('cancels a queued prompt and the autonomous turn, then accepts a new prompt', async () => {
     const c = await boot();
     scripted!.mockNextResponse({
       type: 'function', id: 'task_bash', name: 'Bash', arguments: JSON.stringify({ command: 'sleep 30' }),
@@ -532,13 +631,45 @@ describe('acp-server real prompt turn (scripted LLM)', () => {
       meta: { origin },
     });
     await c.waitForSessionUpdate('tool_call', 10_000);
-    await expect(c.send('session/prompt', {
-      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'overlapping prompt' }],
-    })).rejects.toThrow('turn.agent_busy');
+    const queuedPrompt = c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'queued prompt to cancel' }],
+    });
     c.notify('session/cancel', { sessionId: created.sessionId });
-    await c.waitForSessionUpdate('usage_update', 10_000);
+    await expect(queuedPrompt).resolves.toMatchObject({ stopReason: 'cancelled' });
     await loop.settled();
-    expect(loop.snapshot().state).not.toBe('running');
+    expect(loop.snapshot().queue).toEqual([]);
+    scripted!.mockNextText('accepted after cancel');
+    await expect(c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'new prompt after cancel' }],
+    })).resolves.toMatchObject({ stopReason: 'end_turn' });
+    expect(scripted!.callCount()).toBe(2);
+  }, 30_000);
+
+  it('cancels a queued prompt during session reload without executing it afterward', async () => {
+    const c = await boot();
+    scripted!.mockNextResponse({
+      type: 'function', id: 'task_bash', name: 'Bash', arguments: JSON.stringify({ command: 'sleep 30' }),
+    });
+    c.onRequest('session/request_permission', () => ({
+      outcome: { outcome: 'selected', optionId: 'approve_once' },
+    }));
+    const created = await c.send('session/new', { cwd: homeDir, mcpServers: [] }) as { sessionId: string };
+    const session = getLiveSessionById(c.server.core.accessor, created.sessionId)!;
+    const agent = session.accessor.get(IAgentLifecycleService).handleOf('main')!;
+    const loop = agent.accessor.get(IAgentLoopService);
+    const origin = { kind: 'task', taskId: 'task-example', status: 'completed', notificationId: 'notification-example' };
+    loop.submit({
+      message: { role: 'user', content: [{ type: 'text', text: 'continue after task completion' }] },
+      meta: { origin },
+    });
+    await c.waitForSessionUpdate('tool_call', 10_000);
+    const queuedPrompt = c.send('session/prompt', {
+      sessionId: created.sessionId, prompt: [{ type: 'text', text: 'queued prompt before reload' }],
+    });
+    await c.send('session/load', { sessionId: created.sessionId, cwd: homeDir, mcpServers: [] });
+    await expect(queuedPrompt).resolves.toMatchObject({ stopReason: 'cancelled' });
+    await loop.settled();
+    expect(loop.snapshot().queue).toEqual([]);
     expect(scripted!.callCount()).toBe(1);
   }, 30_000);
 
